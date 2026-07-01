@@ -1,0 +1,44 @@
+{
+  "name": "opencode-cross-session-messaging",
+  "version": "0.0.1",
+  "description": "OpenCode plugin that lets sessions send messages to each other and wait for AI-generated replies (peer-to-peer, cross-project). See cross-session-messaging-design.md.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "multi-agent",
+    "cross-session",
+    "messaging"
+  ],
+  "main": "src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src",
+    "!src/**/*.test.ts",
+    "README.md",
+    "SKILL.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "opencode": ">=1.3.13",
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "prepublishOnly": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.17.4"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^25.9.3",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+bun.lockb
+*.tmp-*
+
+# 本地编辑器 / Agent 配置，勿提交
+.opencode/
+.sisyphus/
+.omo/
+
+# 本地密钥文件（npm token 等），勿提交
+vars.txt
