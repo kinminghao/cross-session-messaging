@@ -1,6 +1,6 @@
 {
   "name": "opencode-cross-session-messaging",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "OpenCode plugin that lets sessions send messages to each other and wait for AI-generated replies (peer-to-peer, cross-project). See cross-session-messaging-design.md.",
   "type": "module",
   "license": "MIT",
@@ -29,6 +29,7 @@
     "!src/**/*.test.ts",
     "tui.tsx",
     "README.md",
+    "README.zh-CN.md",
     "SKILL.md",
     "LICENSE"
   ],
