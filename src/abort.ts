@@ -1,9 +1,10 @@
 /**
- * AbortSignal utilities. Corresponds to executable plan §T10.
+ * AbortSignal utilities used by the ask_session pipeline to coordinate
+ * cancellation and cleanup. Kept dependency-free for isolated unit-test.
  *
- * Both helpers are used by the ask_session pipeline (waitForIdle,
- * askAndWaitForReply) to coordinate cancellation and cleanup. Kept
- * dependency-free so they can be unit-tested in isolation.
+ * NOTE: `withAbortCleanup` is currently unused after the event-driven
+ * refactor of askAndWaitForReply; kept exported since it's a
+ * general-purpose helper that future modules may want.
  */
 
 /** A synchronous or async cleanup callback registered with `withAbortCleanup`. */

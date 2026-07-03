@@ -2,35 +2,28 @@ import { tool } from "@opencode-ai/plugin/tool"
 import { askAndWaitForReply, type AskClient } from "../askAndWaitForReply.ts"
 import {
   DEFAULT_ASK_TIMEOUT_MS,
-  IDLE_WAIT_BUDGET_MS,
   MAX_ASK_TIMEOUT_MS,
 } from "../constants.ts"
 import { log } from "../logger.ts"
 import { readRegistry } from "../registry.ts"
 import {
   AskTimeoutError,
-  IdleWaitTimeoutError,
   NoResponseError,
   SessionNotFoundError,
 } from "../types.ts"
-import { waitForIdle, type StatusClient } from "../waitForIdle.ts"
 
 /**
- * The subset of opencode's SDK client that `ask_session` requires. In
- * production, the real SDK client (from `input.client`) structurally
- * satisfies both `StatusClient` (for `waitForIdle`) and `AskClient` (for
- * `askAndWaitForReply`), so this intersection is the minimum contract.
- */
-export type AskSessionClient = StatusClient & AskClient
-
-/**
- * `ask_session` — orchestrates §T7 registry pre-check + §T8 waitForIdle
- * + §T9 askAndWaitForReply into the user-facing tool. Corresponds to
- * executable plan §T13.
+ * `ask_session` — self-ask guard + timeout clamp + registry pre-check +
+ * event-driven send/wait. NEVER throws; every failure branch converts
+ * to a readable text output.
  *
- * NEVER throws. Every failure mode returns a text output that the calling
- * LLM can read and react to. See `renderError` for the taxonomy.
+ * Rewritten after real-daemon smoke test: dropped the `waitForIdle`
+ * pre-poll because opencode SDK's `session.status` is a directory-scoped
+ * map, not a per-session lookup. The event stream in `askAndWaitForReply`
+ * naturally handles busy-target queueing via loop-wait.
  */
+export type AskSessionClient = AskClient
+
 export function createAskSessionTool(
   client: AskSessionClient,
 ): ReturnType<typeof tool> {
@@ -39,8 +32,8 @@ export function createAskSessionTool(
       "Send a self-contained question to ANOTHER opencode session and wait for its AI-generated reply.",
       "The target session CANNOT see your conversation history — include ALL necessary context",
       "(background, code snippets, constraints) in the `question` text itself.",
-      "If the target is busy, this tool waits (bounded) for it to become idle. On any failure,",
-      "returns a clear error string. This tool NEVER throws.",
+      "If the target is busy, this tool waits (bounded) for it to become idle.",
+      "On any failure, returns a clear error string. This tool NEVER throws.",
     ].join(" "),
     args: {
       sessionId: tool.schema
@@ -65,7 +58,7 @@ export function createAskSessionTool(
         ),
     },
     async execute(args, ctx) {
-      // 1. Self-ask check — cheap, before any I/O.
+      // 1. Self-ask check.
       if (args.sessionId === ctx.sessionID) {
         return {
           title: "self-ask forbidden",
@@ -75,15 +68,14 @@ export function createAskSessionTool(
         }
       }
 
-      // 2. Clamp / default the budget. Defense-in-depth: even if opencode
-      //    doesn't enforce zod .max, our own clamp bounds the wait.
+      // 2. Clamp/default budget.
       const budget = Math.min(
         args.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS,
         MAX_ASK_TIMEOUT_MS,
       )
 
-      // 3. Registry pre-check — produces a much better error than
-      //    letting `waitForIdle` discover a stale session ID as a 404.
+      // 3. Registry pre-check — produces a better error than letting the
+      //    SDK surface a raw 404.
       try {
         const reg = await readRegistry()
         if (!(args.sessionId in reg.sessions)) {
@@ -105,41 +97,18 @@ export function createAskSessionTool(
         }
       }
 
-      const start = Date.now()
+      // 4. Send + event-driven wait for reply.
       try {
-        // 4. Wait for the target to become idle. Consumes a portion of
-        //    the total budget, capped at IDLE_WAIT_BUDGET_MS so a busy
-        //    target doesn't burn the whole ask.
-        const idleBudget = Math.min(IDLE_WAIT_BUDGET_MS, budget)
-        await waitForIdle(client, args.sessionId, {
-          timeoutMs: idleBudget,
-          abort: ctx.abort,
-        })
-
-        // 5. Compute remaining budget for the send-and-wait phase.
-        const remaining = budget - (Date.now() - start)
-        if (remaining <= 0) {
-          return {
-            title: "budget exhausted",
-            output:
-              `ask_session error: exhausted total budget (${budget}ms) waiting for session ${args.sessionId} to become idle. ` +
-              `Increase timeoutMs.`,
-          }
-        }
-
-        // 6. Send + wait for the assistant reply.
         const reply = await askAndWaitForReply(
           client,
           args.sessionId,
           args.question,
-          { timeoutMs: remaining, abort: ctx.abort },
+          { timeoutMs: budget, abort: ctx.abort },
         )
         log.info("ask_session:ok", {
           sessionId: args.sessionId,
           replyChars: reply.length,
         })
-        // Happy path: return the reply directly as a bare string so the
-        // calling LLM sees the target's answer with no framing noise.
         return reply
       } catch (err: unknown) {
         return renderError(args.sessionId, err)
@@ -160,19 +129,12 @@ function renderError(
         `(may have been deleted mid-flight). The registry may be stale — call list_sessions again to refresh.`,
     }
   }
-  if (err instanceof IdleWaitTimeoutError) {
-    return {
-      title: "idle-wait timeout",
-      output:
-        `ask_session error: session ${sessionId} did not become idle within ${err.timeoutMs}ms. ` +
-        `It may be stuck in a long-running task. Try again later or increase timeoutMs.`,
-    }
-  }
   if (err instanceof AskTimeoutError) {
     return {
       title: "reply timeout",
       output:
         `ask_session error: session ${sessionId} did not respond within ${err.timeoutMs}ms. ` +
+        `The target may be busy with a long-running task, or its LLM may be stuck. ` +
         `Try again with a larger timeoutMs (max ${MAX_ASK_TIMEOUT_MS}).`,
     }
   }
@@ -180,7 +142,7 @@ function renderError(
     return {
       title: "no assistant reply",
       output:
-        `ask_session error: session ${sessionId} went idle without producing an assistant reply. ` +
+        `ask_session error: session ${sessionId} produced an empty reply. ` +
         `The prompt may have errored on their side.`,
     }
   }

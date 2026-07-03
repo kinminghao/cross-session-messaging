@@ -6,10 +6,9 @@ import type { AskClientMessage } from "../askAndWaitForReply.ts"
 import { upsertEntry } from "../registry.ts"
 import { createAskSessionTool, type AskSessionClient } from "./askSession.ts"
 
-// ─── Fake combined client (StatusClient & AskClient) ────────────────
+// ─── Fake SSE stream matching hey-api's ServerSentEventsResult ────────────
 
 type FakeEvent = { type: string; properties?: { sessionID?: string } }
-type FakeStatus = { type: string; [k: string]: unknown }
 
 interface Waiter {
   resolve: (v: IteratorResult<FakeEvent>) => void
@@ -20,16 +19,19 @@ function makeFakeEventStream() {
   const queue: FakeEvent[] = []
   const waiters: Waiter[] = []
   let closed = false
-  const iterator: AsyncIterator<FakeEvent> = {
-    async next() {
+
+  const stream = {
+    async next(): Promise<IteratorResult<FakeEvent>> {
       const head = queue.shift()
       if (head !== undefined) return { value: head, done: false }
-      if (closed) return { value: undefined as unknown as FakeEvent, done: true }
+      if (closed) {
+        return { value: undefined as unknown as FakeEvent, done: true }
+      }
       return await new Promise((resolve, reject) => {
         waiters.push({ resolve, reject })
       })
     },
-    async return() {
+    async return(_value?: unknown): Promise<IteratorResult<FakeEvent>> {
       closed = true
       while (waiters.length > 0) {
         const w = waiters.shift()
@@ -37,12 +39,14 @@ function makeFakeEventStream() {
       }
       return { value: undefined as unknown as FakeEvent, done: true }
     },
+    [Symbol.asyncIterator]() {
+      return stream
+    },
   }
+
   return {
-    iterable: {
-      [Symbol.asyncIterator]: () => iterator,
-    } as AsyncIterable<FakeEvent>,
-    push(ev: FakeEvent) {
+    subscribeResult: { stream },
+    push(ev: FakeEvent): void {
       const w = waiters.shift()
       if (w) w.resolve({ value: ev, done: false })
       else queue.push(ev)
@@ -54,29 +58,25 @@ function makeFakeClient() {
   const eventStream = makeFakeEventStream()
   const promptCalls: Array<{ sessionId: string; text: string }> = []
   const messagesBySession: Record<string, AskClientMessage[]> = {}
-  const statusScript: Record<string, Array<FakeStatus | Error>> = {}
-  const statusCalls: Record<string, number> = {}
+  let promptError: unknown = null
 
   const client: AskSessionClient = {
     session: {
-      async status(args) {
-        const script = statusScript[args.path.id] ?? [{ type: "idle" }]
-        const i = statusCalls[args.path.id] ?? 0
-        statusCalls[args.path.id] = i + 1
-        const item = script[Math.min(i, script.length - 1)]
-        if (item instanceof Error) throw item
-        return item ?? { type: "idle" }
-      },
       async promptAsync(args) {
-        const text = args.body.parts.map((p) => p.text).join("")
-        promptCalls.push({ sessionId: args.path.id, text })
+        if (promptError !== null) throw promptError
+        promptCalls.push({
+          sessionId: args.path.id,
+          text: args.body.parts.map((p) => p.text).join(""),
+        })
       },
       async messages(args) {
-        return { messages: messagesBySession[args.path.id] ?? [] }
+        return messagesBySession[args.path.id] ?? []
       },
     },
     event: {
-      subscribe: () => eventStream.iterable,
+      async subscribe() {
+        return eventStream.subscribeResult
+      },
     },
   }
 
@@ -84,19 +84,17 @@ function makeFakeClient() {
     client,
     promptCalls,
     pushEvent: (ev: FakeEvent) => eventStream.push(ev),
-    setStatusScript(sessionId: string, script: Array<FakeStatus | Error>) {
-      statusScript[sessionId] = script
-    },
-    addMessage(sessionId: string, msg: AskClientMessage) {
+    addMessage(sessionId: string, msg: AskClientMessage): void {
       const list = messagesBySession[sessionId] ?? []
       list.push(msg)
       messagesBySession[sessionId] = list
     },
+    setPromptError(err: unknown): void {
+      promptError = err
+    },
   }
 }
 
-// Minimal fake ToolContext. Only `sessionID` and `abort` are read by
-// `askSession` — the rest are structural formalities.
 function makeFakeCtx(
   overrides: { sessionID?: string; abort?: AbortSignal } = {},
 ): Parameters<
@@ -122,10 +120,19 @@ function assistantMsg(text: string, createdAt: number): AskClientMessage {
   }
 }
 
+function asStructured(result: unknown): { title: string; output: string } {
+  if (typeof result !== "object" || result === null) {
+    throw new Error(
+      `expected structured { title, output } result, got: ${String(result)}`,
+    )
+  }
+  return result as { title: string; output: string }
+}
+
 const settle = (ms = 30): Promise<void> =>
   new Promise((r) => setTimeout(r, ms))
 
-// ─── XDG isolation per test ─────────────────────────────────────────
+// ─── XDG isolation per test ───────────────────────────────────────────────
 
 let stateDir: string
 let originalXDG: string | undefined
@@ -151,27 +158,13 @@ async function seedTarget(sessionId: string): Promise<void> {
   })
 }
 
-/**
- * Type guard: unwrap the `{ title, output }` shape the tool returns for
- * every error branch, so tests can assert on `output` without wide `if`s.
- */
-function asStructured(result: unknown): { title: string; output: string } {
-  if (typeof result !== "object" || result === null) {
-    throw new Error(
-      `expected structured { title, output } result, got: ${String(result)}`,
-    )
-  }
-  return result as { title: string; output: string }
-}
-
-// ─── Tests ──────────────────────────────────────────────────────────
+// ─── Tests ────────────────────────────────────────────────────────────────
 
 describe("ask_session tool", () => {
   test("happy path: registered target, idle event + assistant message → returns reply text as string", async () => {
     await seedTarget("ses_target")
     const fake = makeFakeClient()
     const t = createAskSessionTool(fake.client)
-
     const promise = t.execute(
       { sessionId: "ses_target", question: "hello?" },
       makeFakeCtx(),
@@ -183,7 +176,6 @@ describe("ask_session tool", () => {
       properties: { sessionID: "ses_target" },
     })
     const result = await promise
-
     expect(result).toBe("hi from B")
     expect(fake.promptCalls).toEqual([
       { sessionId: "ses_target", text: "hello?" },
@@ -204,7 +196,6 @@ describe("ask_session tool", () => {
   })
 
   test("not in registry: target absent → text error with list_sessions hint, no I/O", async () => {
-    // Do NOT seed. Registry is empty.
     const fake = makeFakeClient()
     const t = createAskSessionTool(fake.client)
     const result = await t.execute(
@@ -217,11 +208,12 @@ describe("ask_session tool", () => {
     expect(fake.promptCalls).toHaveLength(0)
   })
 
-  test("session-not-found (session.status returns 404): text error mentioning deletion + list_sessions", async () => {
+  test("session-not-found via promptAsync 404 → text error mentioning deletion + list_sessions", async () => {
     await seedTarget("ses_target")
     const fake = makeFakeClient()
-    const notFound = Object.assign(new Error("Not Found"), { status: 404 })
-    fake.setStatusScript("ses_target", [notFound])
+    fake.setPromptError(
+      Object.assign(new Error("Not Found"), { status: 404 }),
+    )
     const t = createAskSessionTool(fake.client)
     const result = await t.execute(
       { sessionId: "ses_target", question: "hi there" },
@@ -232,60 +224,46 @@ describe("ask_session tool", () => {
     expect(output).toMatch(/list_sessions/)
   })
 
-  test("idle-wait timeout: target stays busy → text error 'did not become idle'", async () => {
+  test("reply timeout: no idle event within timeoutMs → text error 'did not respond'", async () => {
     await seedTarget("ses_target")
     const fake = makeFakeClient()
-    fake.setStatusScript("ses_target", [{ type: "busy" }])
     const t = createAskSessionTool(fake.client)
     const result = await t.execute(
-      { sessionId: "ses_target", question: "hi there", timeoutMs: 200 },
-      makeFakeCtx(),
-    )
-    const { output } = asStructured(result)
-    expect(output).toMatch(/did not become idle/i)
-  })
-
-  test("reply timeout: idle reached but no reply event → text error 'did not respond'", async () => {
-    await seedTarget("ses_target")
-    const fake = makeFakeClient()
-    // status returns idle by default → waitForIdle completes immediately
-    // Then askAndWaitForReply sends but no session.idle event ever arrives.
-    const t = createAskSessionTool(fake.client)
-    const result = await t.execute(
-      { sessionId: "ses_target", question: "hi there", timeoutMs: 200 },
+      { sessionId: "ses_target", question: "hi there", timeoutMs: 100 },
       makeFakeCtx(),
     )
     const { output } = asStructured(result)
     expect(output).toMatch(/did not respond/i)
   })
 
-  test("no-response: idle event arrives but no assistant message → text error 'went idle without'", async () => {
+  test("no-response: idle arrives but assistant reply text is empty → text error 'empty reply'", async () => {
     await seedTarget("ses_target")
     const fake = makeFakeClient()
     const t = createAskSessionTool(fake.client)
     const promise = t.execute(
-      { sessionId: "ses_target", question: "hi there" },
+      { sessionId: "ses_target", question: "hi there", timeoutMs: 500 },
       makeFakeCtx(),
     )
     await settle()
-    // Push idle but never add an assistant message.
+    fake.addMessage("ses_target", {
+      info: { role: "assistant", time: { created: Date.now() } },
+      parts: [{ type: "text", text: "" }],
+    })
     fake.pushEvent({
       type: "session.idle",
       properties: { sessionID: "ses_target" },
     })
     const result = await promise
     const { output } = asStructured(result)
-    expect(output).toMatch(/went idle without/i)
+    expect(output).toMatch(/empty reply/i)
   })
 
   test("abort: caller aborts mid-wait → text error 'aborted', tool never throws", async () => {
     await seedTarget("ses_target")
     const fake = makeFakeClient()
-    fake.setStatusScript("ses_target", [{ type: "busy" }])
     const ctrl = new AbortController()
     setTimeout(() => ctrl.abort(), 30)
     const t = createAskSessionTool(fake.client)
-    // Explicitly assert no throw by wrapping in try/catch.
     let result: unknown
     let threw = false
     try {

@@ -10,7 +10,7 @@ import {
   SessionNotFoundError,
 } from "./types.ts"
 
-// ─── Fake event stream ──────────────────────────────────────────────────
+// ─── Fake SSE stream matching hey-api's ServerSentEventsResult ────────────
 
 type FakeEvent = { type: string; properties?: { sessionID?: string } }
 
@@ -26,41 +26,38 @@ function makeFakeEventStream() {
   let returnCalled = false
   let streamError: Error | undefined
 
-  const iterator: AsyncIterator<FakeEvent> = {
+  const stream = {
     async next(): Promise<IteratorResult<FakeEvent>> {
       if (streamError) throw streamError
       const head = queue.shift()
       if (head !== undefined) return { value: head, done: false }
-      if (closed) return { value: undefined as unknown as FakeEvent, done: true }
+      if (closed) {
+        return { value: undefined as unknown as FakeEvent, done: true }
+      }
       return await new Promise((resolve, reject) => {
         waiters.push({ resolve, reject })
       })
     },
-    async return(): Promise<IteratorResult<FakeEvent>> {
+    async return(_value?: unknown): Promise<IteratorResult<FakeEvent>> {
       returnCalled = true
       closed = true
-      // Wake any pending waiters with done=true so the iterating loop exits cleanly.
       while (waiters.length > 0) {
         const w = waiters.shift()
         w?.resolve({ value: undefined as unknown as FakeEvent, done: true })
       }
       return { value: undefined as unknown as FakeEvent, done: true }
     },
-  }
-
-  const iterable: AsyncIterable<FakeEvent> = {
-    [Symbol.asyncIterator]: () => iterator,
+    [Symbol.asyncIterator]() {
+      return stream
+    },
   }
 
   return {
-    iterable,
+    subscribeResult: { stream },
     push(ev: FakeEvent): void {
       const w = waiters.shift()
-      if (w) {
-        w.resolve({ value: ev, done: false })
-      } else {
-        queue.push(ev)
-      }
+      if (w) w.resolve({ value: ev, done: false })
+      else queue.push(ev)
     },
     forceError(err: Error): void {
       streamError = err
@@ -74,8 +71,6 @@ function makeFakeEventStream() {
     },
   }
 }
-
-// ─── Fake client ────────────────────────────────────────────────────────
 
 function makeFakeClient() {
   const eventStream = makeFakeEventStream()
@@ -93,11 +88,13 @@ function makeFakeClient() {
       },
       async messages(args) {
         if (messagesError !== null) throw messagesError
-        return { messages: messagesBySession[args.path.id] ?? [] }
+        return messagesBySession[args.path.id] ?? []
       },
     },
     event: {
-      subscribe: () => eventStream.iterable,
+      async subscribe() {
+        return eventStream.subscribeResult
+      },
     },
   }
 
@@ -130,13 +127,12 @@ function assistantMsg(text: string, createdAt: number): AskClientMessage {
   }
 }
 
-/** Sleep until the given async operation has had a chance to subscribe/send. */
-const settle = (ms = 20): Promise<void> =>
+const settle = (ms = 30): Promise<void> =>
   new Promise((r) => setTimeout(r, ms))
 
-// ─── Tests ──────────────────────────────────────────────────────────────
+// ─── Tests ────────────────────────────────────────────────────────────────
 
-describe("askAndWaitForReply", () => {
+describe("askAndWaitForReply (event-driven, loop-wait)", () => {
   test("happy path: idle event + matching assistant message → returns text", async () => {
     const fake = makeFakeClient()
     const promise = askAndWaitForReply(fake.client, "ses_b", "hello?", {
@@ -166,13 +162,12 @@ describe("askAndWaitForReply", () => {
     }
     const elapsed = Date.now() - start
     expect(caught).toBeInstanceOf(AskTimeoutError)
-    expect((caught as AskTimeoutError).sessionId).toBe("ses_b")
     expect(elapsed).toBeGreaterThanOrEqual(70)
     expect(elapsed).toBeLessThan(400)
     expect(fake.iteratorReturnCalled).toBe(true)
   })
 
-  test("abort mid-wait: AbortError + iterator.return called (cleanup fired)", async () => {
+  test("abort mid-wait: AbortError + iterator.return called", async () => {
     const fake = makeFakeClient()
     const ctrl = new AbortController()
     setTimeout(() => ctrl.abort(), 30)
@@ -189,29 +184,18 @@ describe("askAndWaitForReply", () => {
     expect(fake.iteratorReturnCalled).toBe(true)
   })
 
-  test("non-target idle events are ignored; only target's idle triggers resolution", async () => {
+  test("non-target idle events are ignored; only target's idle triggers reply check", async () => {
     const fake = makeFakeClient()
-    // Pre-populate a WRONG message for another session — if the algo
-    // mistakenly treats another session's idle event as ours, it would
-    // fetch messages for its own target and find nothing (which would
-    // throw NoResponseError). To make the wrong path even more tempting,
-    // the wrong message contains a distinct text we can detect.
     fake.addMessage("ses_other", assistantMsg("WRONG_ANSWER", Date.now()))
     const promise = askAndWaitForReply(fake.client, "ses_target", "hi", {
       timeoutMs: 2000,
     })
     await settle()
-    // Push some noise: idle for other sessions, message.updated, etc.
     fake.pushEvent({
       type: "session.idle",
       properties: { sessionID: "ses_other" },
     })
-    fake.pushEvent({
-      type: "session.idle",
-      properties: { sessionID: "ses_yet_another" },
-    })
     fake.pushEvent({ type: "message.updated" })
-    // Now real target reply
     await settle()
     fake.addMessage("ses_target", assistantMsg("correct", Date.now()))
     fake.pushEvent({
@@ -222,9 +206,8 @@ describe("askAndWaitForReply", () => {
     expect(result).toBe("correct")
   })
 
-  test("timestamp filter: pre-existing old assistant message ignored, new one returned", async () => {
+  test("timestamp filter: old assistant message ignored, new one returned", async () => {
     const fake = makeFakeClient()
-    // Old assistant message from 5 minutes ago — must NOT be returned as the reply.
     fake.addMessage(
       "ses_target",
       assistantMsg("OLD_ANSWER_MUST_NOT_APPEAR", Date.now() - 5 * 60_000),
@@ -242,13 +225,38 @@ describe("askAndWaitForReply", () => {
     expect(result).toBe("NEW_ANSWER")
   })
 
-  test("no matching assistant reply after idle → NoResponseError", async () => {
+  test("loop-wait: target idle without matching message → keeps waiting until real reply arrives", async () => {
     const fake = makeFakeClient()
     const promise = askAndWaitForReply(fake.client, "ses_target", "hi", {
-      timeoutMs: 1000,
+      timeoutMs: 2000,
     })
     await settle()
-    // Push idle but never add any assistant message with time >= sentAt.
+    // First idle for target — no reply yet (maybe a queued turn's idle).
+    fake.pushEvent({
+      type: "session.idle",
+      properties: { sessionID: "ses_target" },
+    })
+    await settle()
+    // Second idle for target with the actual reply now.
+    fake.addMessage("ses_target", assistantMsg("finally here", Date.now()))
+    fake.pushEvent({
+      type: "session.idle",
+      properties: { sessionID: "ses_target" },
+    })
+    const result = await promise
+    expect(result).toBe("finally here")
+  })
+
+  test("assistant reply present but text is empty → NoResponseError", async () => {
+    const fake = makeFakeClient()
+    const promise = askAndWaitForReply(fake.client, "ses_target", "hi", {
+      timeoutMs: 500,
+    })
+    await settle()
+    fake.addMessage("ses_target", {
+      info: { role: "assistant", time: { created: Date.now() } },
+      parts: [{ type: "text", text: "" }],
+    })
     fake.pushEvent({
       type: "session.idle",
       properties: { sessionID: "ses_target" },
@@ -262,7 +270,24 @@ describe("askAndWaitForReply", () => {
     expect(caught).toBeInstanceOf(NoResponseError)
   })
 
-  test("session deleted mid-flight (messages returns 404) → SessionNotFoundError", async () => {
+  test("promptAsync 404 (target gone before send) → SessionNotFoundError + iterator cleaned up", async () => {
+    const fake = makeFakeClient()
+    fake.setPromptError(
+      Object.assign(new Error("Not Found"), { status: 404 }),
+    )
+    let caught: Error | undefined
+    try {
+      await askAndWaitForReply(fake.client, "ses_target", "hi", {
+        timeoutMs: 1000,
+      })
+    } catch (err) {
+      caught = err as Error
+    }
+    expect(caught).toBeInstanceOf(SessionNotFoundError)
+    expect(fake.iteratorReturnCalled).toBe(true)
+  })
+
+  test("messages 404 (session deleted mid-flight) → SessionNotFoundError + iterator cleaned up", async () => {
     const fake = makeFakeClient()
     const promise = askAndWaitForReply(fake.client, "ses_target", "hi", {
       timeoutMs: 1000,

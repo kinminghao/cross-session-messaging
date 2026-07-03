@@ -41,10 +41,9 @@ export interface AskSessionArgs {
 }
 
 /**
- * Distinct error subclasses for the 6-error taxonomy in `ask_session`
- * (executable plan §T13). `askSession` catches these and converts them to
- * user-facing text strings — the errors themselves are used for control flow
- * inside the core algorithm modules (`waitForIdle`, `askAndWaitForReply`).
+ * Error subclasses used inside `askAndWaitForReply` for control flow.
+ * The `ask_session` tool catches these and converts them to user-facing
+ * text strings — the classes themselves never surface to LLM callers.
  */
 
 export class SessionNotFoundError extends Error {
@@ -66,17 +65,7 @@ export class AskTimeoutError extends Error {
 
 export class NoResponseError extends Error {
   constructor(public readonly sessionId: string) {
-    super(`Session ${sessionId} went idle without emitting a reply`)
+    super(`Session ${sessionId} produced an empty reply`)
     this.name = "NoResponseError"
-  }
-}
-
-export class IdleWaitTimeoutError extends Error {
-  constructor(
-    public readonly sessionId: string,
-    public readonly timeoutMs: number,
-  ) {
-    super(`Session ${sessionId} did not become idle within ${timeoutMs}ms`)
-    this.name = "IdleWaitTimeoutError"
   }
 }
