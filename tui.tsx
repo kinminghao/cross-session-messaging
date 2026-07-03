@@ -2,14 +2,49 @@
 import { createSignal, For, Show } from "solid-js"
 import { useKeyboard } from "@opentui/solid"
 import type { TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import { execSync } from "node:child_process"
 import { PLUGIN_ID } from "./src/constants.ts"
-import { listEntries } from "./src/registry.ts"
+import { listEntries, upsertEntry } from "./src/registry.ts"
 import type { RegistryEntry } from "./src/types.ts"
 
 function formatAge(ms: number): string {
   if (ms < 60_000) return `${Math.floor(ms / 1000)}s`
   if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m`
   return `${Math.floor(ms / 3_600_000)}h`
+}
+
+function copyToClipboard(text: string): boolean {
+  try {
+    const cmd =
+      process.platform === "darwin"
+        ? "pbcopy"
+        : process.platform === "linux"
+          ? "xclip -selection clipboard"
+          : process.platform === "win32"
+            ? "clip"
+            : undefined
+    if (!cmd) return false
+    execSync(cmd, { input: text, stdio: ["pipe", "ignore", "ignore"] })
+    return true
+  } catch {
+    return false
+  }
+}
+
+function formatSessionInfo(entry: RegistryEntry): string {
+  return [
+    `Use the ask_session tool to communicate with this peer session:`,
+    ``,
+    `- Session ID: ${entry.sessionId}`,
+    `- Summary: ${entry.summary}`,
+    `- Directory: ${entry.directory}`,
+    `- Project: ${entry.projectId}`,
+    ``,
+    `ask_session(sessionId="${entry.sessionId}", question="<your self-contained question here>")`,
+    ``,
+    `IMPORTANT: The target session CANNOT see your conversation history.`,
+    `Include ALL necessary context (background, code snippets, constraints) in the question text itself.`,
+  ].join("\n")
 }
 
 function SessionRow(props: {
@@ -83,6 +118,25 @@ function PeersPanel(props: {
       evt.preventDefault()
       evt.stopPropagation()
       move(1)
+      return
+    }
+    if (evt.name === "return") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      const entry = props.entries[index()]
+      if (!entry) return
+      const text = formatSessionInfo(entry)
+      if (copyToClipboard(text)) {
+        api.ui.toast({
+          variant: "success",
+          message: `Copied session info for ${entry.sessionId}`,
+        })
+      } else {
+        api.ui.toast({
+          variant: "error",
+          message: "Failed to copy to clipboard.",
+        })
+      }
     }
   })
 
@@ -99,7 +153,7 @@ function PeersPanel(props: {
         <text fg={theme().text}>
           <b>Peer Sessions ({props.entries.length})</b>
         </text>
-        <text fg={theme().textMuted}>↑↓ navigate · esc close</text>
+        <text fg={theme().textMuted}>↑↓ navigate · enter copy · esc close</text>
       </box>
       <For each={props.entries}>
         {(entry, i) => (
@@ -147,6 +201,62 @@ const plugin: TuiPluginModule = {
               message: `Failed to list sessions: ${error instanceof Error ? error.message : String(error)}`,
             })
           }
+        },
+      },
+      {
+        title: "Register current session",
+        value: `${PLUGIN_ID}.register`,
+        category: "Sessions",
+        slash: { name: "register" },
+        onSelect: async () => {
+          const route = api.route.current
+          if (route.name !== "session") {
+            api.ui.toast({
+              variant: "warning",
+              message: "Navigate to a session first.",
+            })
+            return
+          }
+          const sessionID = route.params.sessionID as string
+          const session = api.state.session.get(sessionID)
+          const defaultSummary = session?.title ?? ""
+          api.ui.dialog.setSize("medium")
+          api.ui.dialog.replace(() => (
+            <api.ui.DialogPrompt
+              title="Register Session"
+              placeholder="e.g. refactoring OAuth in src/auth/oauth.ts"
+              value={defaultSummary}
+              onConfirm={async (summary: string) => {
+                api.ui.dialog.clear()
+                const trimmed = summary.trim()
+                if (trimmed.length < 5) {
+                  api.ui.toast({
+                    variant: "warning",
+                    message: "Summary must be at least 5 characters.",
+                  })
+                  return
+                }
+                try {
+                  await upsertEntry({
+                    sessionId: sessionID,
+                    summary: trimmed,
+                    directory: api.state.path.directory,
+                    projectId: api.state.path.worktree,
+                  })
+                  api.ui.toast({
+                    variant: "success",
+                    message: `Session registered: ${trimmed}`,
+                  })
+                } catch (error) {
+                  api.ui.toast({
+                    variant: "error",
+                    message: `Failed to register: ${error instanceof Error ? error.message : String(error)}`,
+                  })
+                }
+              }}
+              onCancel={() => api.ui.dialog.clear()}
+            />
+          ))
         },
       },
     ])
