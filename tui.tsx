@@ -271,7 +271,7 @@ const plugin: TuiPluginModule = {
             })
             return
           }
-          const sessionID = route.params.sessionID as string
+          const sessionID = route.params?.sessionID as string
           const session = api.state.session.get(sessionID)
           const defaultSummary = session?.title ?? ""
           api.ui.dialog.setSize("medium")

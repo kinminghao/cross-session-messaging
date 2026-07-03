@@ -4,6 +4,10 @@
   "description": "OpenCode plugin that lets sessions send messages to each other and wait for AI-generated replies (peer-to-peer, cross-project). See cross-session-messaging-design.md.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kinminghao/cross-session-messaging.git"
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",

@@ -4,6 +4,7 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "strict": true,
+    "jsx": "preserve",
     "skipLibCheck": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
@@ -13,5 +14,5 @@
     "lib": ["ESNext"],
     "types": ["node", "bun"]
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*", "tui.tsx"]
 }
