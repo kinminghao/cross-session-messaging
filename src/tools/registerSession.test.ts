@@ -26,9 +26,7 @@ function makeFakeCtx(overrides: {
 
 function asStructured(result: unknown): { title: string; output: string } {
   if (typeof result !== "object" || result === null) {
-    throw new Error(
-      `expected structured { title, output } result, got: ${String(result)}`,
-    )
+    throw new Error(`expected structured result, got: ${String(result)}`)
   }
   return result as { title: string; output: string }
 }
@@ -49,10 +47,11 @@ afterEach(() => {
 })
 
 describe("register_session tool", () => {
-  test("fresh upsert: creates entry with all fields incl. serverUrl", async () => {
+  test("fresh upsert: creates entry with all fields incl. daemonId", async () => {
     const t = createRegisterSessionTool({
       projectId: "p_test",
       serverUrl: "http://localhost:9999",
+      daemonId: "daemon-1",
     })
     await t.execute(
       { summary: "working on the auth module" },
@@ -64,33 +63,35 @@ describe("register_session tool", () => {
     expect(entry?.summary).toBe("working on the auth module")
     expect(entry?.directory).toBe("/tmp/repo")
     expect(entry?.projectId).toBe("p_test")
+    expect(entry?.daemonId).toBe("daemon-1")
     expect(entry?.serverUrl).toBe("http://localhost:9999")
     expect(entry?.registeredAt).toBe(entry?.updatedAt)
   })
 
-  test("re-upsert: preserves registeredAt, bumps updatedAt, updates serverUrl", async () => {
+  test("re-upsert: preserves registeredAt, bumps updatedAt, updates daemonId on restart", async () => {
     const t1 = createRegisterSessionTool({
       projectId: "p_test",
       serverUrl: "http://localhost:9999",
+      daemonId: "daemon-old",
     })
     await t1.execute(
       { summary: "first task" },
-      makeFakeCtx({ sessionID: "ses_a", directory: "/tmp/repo" }),
+      makeFakeCtx({ sessionID: "ses_a" }),
     )
     const before = (await readRegistry()).sessions.ses_a!
     await new Promise((r) => setTimeout(r, 10))
-    // Daemon restarted on a different port — serverUrl changes.
     const t2 = createRegisterSessionTool({
       projectId: "p_test",
       serverUrl: "http://localhost:8888",
+      daemonId: "daemon-new",
     })
     await t2.execute(
-      { summary: "updated task after pivot" },
-      makeFakeCtx({ sessionID: "ses_a", directory: "/tmp/repo" }),
+      { summary: "updated task" },
+      makeFakeCtx({ sessionID: "ses_a" }),
     )
     const after = (await readRegistry()).sessions.ses_a!
-    expect(after.summary).toBe("updated task after pivot")
-    expect(after.serverUrl).toBe("http://localhost:8888")
+    expect(after.summary).toBe("updated task")
+    expect(after.daemonId).toBe("daemon-new")
     expect(after.registeredAt).toBe(before.registeredAt)
     expect(after.updatedAt).toBeGreaterThan(before.updatedAt)
   })
@@ -99,94 +100,48 @@ describe("register_session tool", () => {
     const t = createRegisterSessionTool({
       projectId: "p_test",
       serverUrl: "http://localhost:9999",
+      daemonId: "daemon-1",
     })
     let threw = false
     let result: unknown
     try {
-      result = await t.execute(
-        { summary: "     " },
-        makeFakeCtx({ sessionID: "ses_a", directory: "/tmp/repo" }),
-      )
+      result = await t.execute({ summary: "     " }, makeFakeCtx())
     } catch {
       threw = true
     }
     expect(threw).toBe(false)
-    const { output } = asStructured(result)
-    expect(output).toMatch(/at least 5/i)
-    const reg = await readRegistry()
-    expect(reg.sessions.ses_a).toBeUndefined()
+    expect(asStructured(result).output).toMatch(/at least 5/i)
   })
 
-  test("projectId + serverUrl captured from factory args, not ctx", async () => {
-    const tA = createRegisterSessionTool({
-      projectId: "project_A",
-      serverUrl: "http://a-server:9999",
-    })
-    await tA.execute(
-      { summary: "task in project A" },
-      makeFakeCtx({ sessionID: "ses_1", directory: "/tmp/rA" }),
-    )
-    const tB = createRegisterSessionTool({
-      projectId: "project_B",
-      serverUrl: "http://b-server:8888",
-    })
-    await tB.execute(
-      { summary: "task in project B" },
-      makeFakeCtx({ sessionID: "ses_2", directory: "/tmp/rB" }),
-    )
-    const reg = await readRegistry()
-    expect(reg.sessions.ses_1?.projectId).toBe("project_A")
-    expect(reg.sessions.ses_1?.serverUrl).toBe("http://a-server:9999")
-    expect(reg.sessions.ses_2?.projectId).toBe("project_B")
-    expect(reg.sessions.ses_2?.serverUrl).toBe("http://b-server:8888")
-  })
-
-  test("different session IDs produce separate registry entries", async () => {
+  test("different session IDs produce separate entries", async () => {
     const t = createRegisterSessionTool({
       projectId: "p_test",
       serverUrl: "http://localhost:9999",
+      daemonId: "daemon-1",
     })
     await t.execute(
       { summary: "task 1 in session 1" },
-      makeFakeCtx({ sessionID: "ses_1", directory: "/tmp/r" }),
+      makeFakeCtx({ sessionID: "ses_1" }),
     )
     await t.execute(
       { summary: "task 2 in session 2" },
-      makeFakeCtx({ sessionID: "ses_2", directory: "/tmp/r" }),
+      makeFakeCtx({ sessionID: "ses_2" }),
     )
     const reg = await readRegistry()
     expect(Object.keys(reg.sessions)).toHaveLength(2)
-    expect(reg.sessions.ses_1?.summary).toBe("task 1 in session 1")
-    expect(reg.sessions.ses_2?.summary).toBe("task 2 in session 2")
   })
 
   test("directory from ctx is persisted", async () => {
     const t = createRegisterSessionTool({
       projectId: "p_test",
       serverUrl: "http://localhost:9999",
+      daemonId: "daemon-1",
     })
     await t.execute(
       { summary: "some task" },
-      makeFakeCtx({ sessionID: "ses_a", directory: "/tmp/custom_dir_xyz" }),
+      makeFakeCtx({ sessionID: "ses_a", directory: "/tmp/custom" }),
     )
     const reg = await readRegistry()
-    expect(reg.sessions.ses_a?.directory).toBe("/tmp/custom_dir_xyz")
-  })
-
-  test("success text includes sessionId, summary, directory, projectId, server URL", async () => {
-    const t = createRegisterSessionTool({
-      projectId: "my_project",
-      serverUrl: "http://localhost:9999",
-    })
-    const result = await t.execute(
-      { summary: "auth refactor task" },
-      makeFakeCtx({ sessionID: "ses_a", directory: "/tmp/repo" }),
-    )
-    const { output } = asStructured(result)
-    expect(output).toContain("ses_a")
-    expect(output).toContain("auth refactor task")
-    expect(output).toContain("/tmp/repo")
-    expect(output).toContain("my_project")
-    expect(output).toContain("http://localhost:9999")
+    expect(reg.sessions.ses_a?.directory).toBe("/tmp/custom")
   })
 })

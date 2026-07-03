@@ -39,3 +39,9 @@ export const REGISTRY_FILENAME = "agents-registry.json"
  * `list_sessions`. Defense-in-depth for a missed `session.deleted` event.
  */
 export const STALE_ENTRY_TTL_MS = 24 * 60 * 60 * 1000
+
+/** File-based cross-daemon IPC. */
+export const MESSAGES_DIR_NAME = "messages"
+export const RESPONSE_POLL_MS = 500
+export const INBOX_POLL_MS = 1_000
+export const INBOX_REQUEST_TIMEOUT_MS = 5 * 60_000

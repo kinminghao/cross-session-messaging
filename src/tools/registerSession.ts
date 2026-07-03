@@ -5,6 +5,7 @@ import { log } from "../logger.ts"
 export function createRegisterSessionTool(input: {
   projectId: string
   serverUrl: string
+  daemonId: string
 }): ReturnType<typeof tool> {
   return tool({
     description: [
@@ -38,6 +39,7 @@ export function createRegisterSessionTool(input: {
           directory: ctx.directory,
           projectId: input.projectId,
           serverUrl: input.serverUrl,
+          daemonId: input.daemonId,
         })
         log.info("register_session:ok", {
           sessionId: ctx.sessionID,
@@ -50,7 +52,6 @@ export function createRegisterSessionTool(input: {
             `Summary: ${summary}\n` +
             `Directory: ${ctx.directory}\n` +
             `Project: ${input.projectId}\n` +
-            `Server: ${input.serverUrl}\n` +
             `Updated: ${new Date(entry.updatedAt).toISOString()}`,
         }
       } catch (error) {

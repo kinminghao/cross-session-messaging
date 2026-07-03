@@ -1,27 +1,19 @@
 import { tool } from "@opencode-ai/plugin/tool"
-import { askAndWaitForReply, type AskClient } from "../askAndWaitForReply.ts"
+import { randomUUID } from "node:crypto"
 import {
   DEFAULT_ASK_TIMEOUT_MS,
   MAX_ASK_TIMEOUT_MS,
 } from "../constants.ts"
+import {
+  cleanupRequest,
+  pollForResponse,
+  writeRequest,
+} from "../fileTransport.ts"
 import { log } from "../logger.ts"
 import { readRegistry } from "../registry.ts"
-import {
-  AskTimeoutError,
-  NoResponseError,
-  SessionNotFoundError,
-} from "../types.ts"
+import { AskTimeoutError } from "../types.ts"
 
-/**
- * Given the target's daemon URL, produce a client aimed at that daemon.
- * Production wiring uses `createOpencodeClient` from the SDK; tests
- * inject a fake that ignores the URL and returns a canned client.
- */
-export type AskClientFactory = (serverUrl: string) => AskClient
-
-export function createAskSessionTool(
-  makeClient: AskClientFactory,
-): ReturnType<typeof tool> {
+export function createAskSessionTool(): ReturnType<typeof tool> {
   return tool({
     description: [
       "Send a self-contained question to ANOTHER opencode session and wait for its AI-generated reply.",
@@ -67,7 +59,6 @@ export function createAskSessionTool(
         MAX_ASK_TIMEOUT_MS,
       )
 
-      let targetServerUrl: string
       try {
         const reg = await readRegistry()
         const entry = reg.sessions[args.sessionId]
@@ -79,15 +70,14 @@ export function createAskSessionTool(
               `It may have exited or never registered. Call list_sessions to see current active sessions.`,
           }
         }
-        if (!entry.serverUrl) {
+        if (!entry.daemonId) {
           return {
-            title: "target has no serverUrl",
+            title: "target has no daemonId",
             output:
               `ask_session error: session ${args.sessionId} was registered by an older plugin version ` +
-              `that did not record its daemon URL. Ask the target session to call register_session again.`,
+              `that did not record its daemon identity. Ask the target session to call register_session again.`,
           }
         }
-        targetServerUrl = entry.serverUrl
       } catch (err: unknown) {
         log.warn("ask_session:registry-read-fail", { error: String(err) })
         return {
@@ -99,72 +89,67 @@ export function createAskSessionTool(
         }
       }
 
-      // Build a client aimed at the TARGET's daemon, not our own.
-      const targetClient = makeClient(targetServerUrl)
-
+      const requestId = randomUUID()
       try {
-        const reply = await askAndWaitForReply(
-          targetClient,
-          args.sessionId,
-          args.question,
-          { timeoutMs: budget, abort: ctx.abort },
-        )
+        await writeRequest({
+          requestId,
+          toSessionId: args.sessionId,
+          question: args.question,
+          createdAt: Date.now(),
+        })
+        const res = await pollForResponse(requestId, args.sessionId, {
+          timeoutMs: budget,
+          abort: ctx.abort,
+        })
+        if (res.error) {
+          return {
+            title: "target error",
+            output: `ask_session error: target session reported an error: ${res.error}`,
+          }
+        }
+        if (!res.reply) {
+          return {
+            title: "empty reply",
+            output: `ask_session error: session ${args.sessionId} produced an empty reply.`,
+          }
+        }
         log.info("ask_session:ok", {
           sessionId: args.sessionId,
-          replyChars: reply.length,
+          replyChars: res.reply.length,
         })
-        return reply
+        return res.reply
       } catch (err: unknown) {
-        return renderError(args.sessionId, err)
+        if (err instanceof AskTimeoutError) {
+          return {
+            title: "reply timeout",
+            output:
+              `ask_session error: session ${args.sessionId} did not respond within ${budget}ms. ` +
+              `The target may be busy or its inbox watcher may not be running. ` +
+              `Try again with a larger timeoutMs (max ${MAX_ASK_TIMEOUT_MS}).`,
+          }
+        }
+        const errName =
+          err && typeof err === "object" && "name" in err
+            ? String((err as { name?: unknown }).name)
+            : ""
+        if (errName === "AbortError") {
+          return {
+            title: "aborted",
+            output: `ask_session error: the ask was aborted (either by tool cancellation or user interrupt).`,
+          }
+        }
+        const errMsg = err instanceof Error ? err.message : String(err)
+        log.warn("ask_session:unknown-error", {
+          sessionId: args.sessionId,
+          error: errMsg,
+        })
+        return {
+          title: "unexpected error",
+          output: `ask_session error: unexpected error contacting session ${args.sessionId}: ${errMsg}`,
+        }
+      } finally {
+        await cleanupRequest(requestId)
       }
     },
   })
-}
-
-function renderError(
-  sessionId: string,
-  err: unknown,
-): { title: string; output: string } {
-  if (err instanceof SessionNotFoundError) {
-    return {
-      title: "session not found",
-      output:
-        `ask_session error: session ${sessionId} was found in the registry but its daemon reports the session does not exist ` +
-        `(may have been deleted mid-flight, or the daemon may have restarted). ` +
-        `Call list_sessions to refresh — stale entries auto-prune within 24h.`,
-    }
-  }
-  if (err instanceof AskTimeoutError) {
-    return {
-      title: "reply timeout",
-      output:
-        `ask_session error: session ${sessionId} did not respond within ${err.timeoutMs}ms. ` +
-        `The target may be busy with a long-running task, or its LLM may be stuck. ` +
-        `Try again with a larger timeoutMs (max ${MAX_ASK_TIMEOUT_MS}).`,
-    }
-  }
-  if (err instanceof NoResponseError) {
-    return {
-      title: "no assistant reply",
-      output:
-        `ask_session error: session ${sessionId} produced an empty reply. ` +
-        `The prompt may have errored on their side.`,
-    }
-  }
-  const errName =
-    err && typeof err === "object" && "name" in err
-      ? String((err as { name?: unknown }).name)
-      : ""
-  if (errName === "AbortError") {
-    return {
-      title: "aborted",
-      output: `ask_session error: the ask was aborted (either by tool cancellation or user interrupt).`,
-    }
-  }
-  const errMsg = err instanceof Error ? err.message : String(err)
-  log.warn("ask_session:unknown-error", { sessionId, error: errMsg })
-  return {
-    title: "unexpected error",
-    output: `ask_session error: unexpected error contacting session ${sessionId}: ${errMsg}`,
-  }
 }

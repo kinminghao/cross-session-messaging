@@ -1,8 +1,9 @@
 import type { PluginModule } from "@opencode-ai/plugin"
-import { createOpencodeClient } from "@opencode-ai/sdk"
+import { randomUUID } from "node:crypto"
 import type { AskClient } from "./askAndWaitForReply.ts"
 import { PLUGIN_ID } from "./constants.ts"
 import { createEventHandler } from "./eventHooks.ts"
+import { InboxWatcher } from "./inbox.ts"
 import { initLogger, log } from "./logger.ts"
 import { createAskSessionTool } from "./tools/askSession.ts"
 import { createListSessionsTool } from "./tools/listSessions.ts"
@@ -12,33 +13,34 @@ const plugin: PluginModule = {
   id: PLUGIN_ID,
   server: async (input) => {
     initLogger(input.client)
+    const daemonId = randomUUID()
     log.info("plugin:init", {
       projectId: input.project.id,
       directory: input.directory,
-      serverUrl: input.serverUrl.toString(),
+      daemonId,
     })
+
+    const watcher = new InboxWatcher(
+      input.client as unknown as AskClient,
+      daemonId,
+    )
+    watcher.start()
 
     return {
       tool: {
         register_session: createRegisterSessionTool({
           projectId: input.project.id,
           serverUrl: input.serverUrl.toString(),
+          daemonId,
         }),
         list_sessions: createListSessionsTool(),
-        // The factory constructs an OpencodeClient aimed at the TARGET
-        // session's daemon (URL read from the registry). The SDK's generic
-        // Options<T> signatures don't structurally match our minimal
-        // AskClient duck-type, so we cast at this boundary — safe at
-        // runtime because we only invoke the operations AskClient covers.
-        ask_session: createAskSessionTool(
-          (url) =>
-            createOpencodeClient({ baseUrl: url }) as unknown as AskClient,
-        ),
+        ask_session: createAskSessionTool(),
       },
 
       event: createEventHandler(),
 
       dispose: async () => {
+        await watcher.dispose()
         log.info("plugin:dispose")
       },
     }

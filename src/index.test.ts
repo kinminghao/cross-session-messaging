@@ -19,32 +19,31 @@ function makeFakeInput(): PluginInput {
 }
 
 describe("plugin default export", () => {
-  test("plugin metadata: id is 'cross-session-messaging' and server is a function", () => {
+  test("plugin metadata: id and server function", () => {
     expect(plugin.id).toBe("cross-session-messaging")
     expect(typeof plugin.server).toBe("function")
   })
 
-  test("server() wires all 3 tools + event + dispose hooks", async () => {
+  test("server() wires all 3 tools + event + dispose", async () => {
     const hooks = await plugin.server(makeFakeInput())
     expect(hooks.tool?.register_session).toBeDefined()
     expect(hooks.tool?.list_sessions).toBeDefined()
     expect(hooks.tool?.ask_session).toBeDefined()
     expect(typeof hooks.event).toBe("function")
     expect(typeof hooks.dispose).toBe("function")
+    await hooks.dispose?.()
   })
 
-  test("event handler no-throw on unrelated event types", async () => {
+  test("event handler no-throw on unrelated event", async () => {
     const hooks = await plugin.server(makeFakeInput())
-    const handler = hooks.event
-    expect(handler).toBeDefined()
     let threw = false
     try {
-      // Fire an unrelated event — should be a silent no-op with zero registry I/O.
-      // biome-ignore lint/suspicious/noExplicitAny: bypassing SDK's Event discriminated union for this smoke test.
-      await handler!({ event: { type: "chat.message" } as any })
+      // biome-ignore lint/suspicious/noExplicitAny: bypass SDK Event union
+      await hooks.event!({ event: { type: "chat.message" } as any })
     } catch {
       threw = true
     }
     expect(threw).toBe(false)
+    await hooks.dispose?.()
   })
 })

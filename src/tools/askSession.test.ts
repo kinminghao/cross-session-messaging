@@ -2,105 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { AskClientMessage } from "../askAndWaitForReply.ts"
 import { upsertEntry } from "../registry.ts"
+import { writeResponse, getMessagesDir } from "../fileTransport.ts"
 import { createAskSessionTool } from "./askSession.ts"
-
-type FakeEvent = { type: string; properties?: { sessionID?: string } }
-
-interface Waiter {
-  resolve: (v: IteratorResult<FakeEvent>) => void
-  reject: (err: unknown) => void
-}
-
-function makeFakeEventStream() {
-  const queue: FakeEvent[] = []
-  const waiters: Waiter[] = []
-  let closed = false
-
-  const stream = {
-    async next(): Promise<IteratorResult<FakeEvent>> {
-      const head = queue.shift()
-      if (head !== undefined) return { value: head, done: false }
-      if (closed) {
-        return { value: undefined as unknown as FakeEvent, done: true }
-      }
-      return await new Promise((resolve, reject) => {
-        waiters.push({ resolve, reject })
-      })
-    },
-    async return(_value?: unknown): Promise<IteratorResult<FakeEvent>> {
-      closed = true
-      while (waiters.length > 0) {
-        const w = waiters.shift()
-        w?.resolve({ value: undefined as unknown as FakeEvent, done: true })
-      }
-      return { value: undefined as unknown as FakeEvent, done: true }
-    },
-    [Symbol.asyncIterator]() {
-      return stream
-    },
-  }
-
-  return {
-    subscribeResult: { stream },
-    push(ev: FakeEvent): void {
-      const w = waiters.shift()
-      if (w) w.resolve({ value: ev, done: false })
-      else queue.push(ev)
-    },
-  }
-}
-
-function makeFakeClient() {
-  const eventStream = makeFakeEventStream()
-  const promptCalls: Array<{ sessionId: string; text: string }> = []
-  const messagesBySession: Record<string, AskClientMessage[]> = {}
-  let promptError: unknown = null
-
-  return {
-    client: {
-      session: {
-        async promptAsync(args: {
-          path: { id: string }
-          body: { parts: Array<{ type: "text"; text: string }> }
-        }): Promise<void> {
-          if (promptError !== null) throw promptError
-          promptCalls.push({
-            sessionId: args.path.id,
-            text: args.body.parts.map((p) => p.text).join(""),
-          })
-        },
-        async messages(args: {
-          path: { id: string }
-        }): Promise<AskClientMessage[]> {
-          return messagesBySession[args.path.id] ?? []
-        },
-      },
-      event: {
-        async subscribe(): Promise<{ stream: AsyncIterable<unknown> }> {
-          return eventStream.subscribeResult
-        },
-      },
-    },
-    promptCalls,
-    pushEvent: (ev: FakeEvent) => eventStream.push(ev),
-    addMessage(sessionId: string, msg: AskClientMessage): void {
-      const list = messagesBySession[sessionId] ?? []
-      list.push(msg)
-      messagesBySession[sessionId] = list
-    },
-    setPromptError(err: unknown): void {
-      promptError = err
-    },
-  }
-}
 
 function makeFakeCtx(
   overrides: { sessionID?: string; abort?: AbortSignal } = {},
-): Parameters<
-  ReturnType<typeof createAskSessionTool>["execute"]
->[1] {
+): Parameters<ReturnType<typeof createAskSessionTool>["execute"]>[1] {
   return {
     sessionID: "ses_caller",
     messageID: "msg_1",
@@ -114,24 +22,12 @@ function makeFakeCtx(
   }
 }
 
-function assistantMsg(text: string, createdAt: number): AskClientMessage {
-  return {
-    info: { role: "assistant", time: { created: createdAt } },
-    parts: [{ type: "text", text }],
-  }
-}
-
 function asStructured(result: unknown): { title: string; output: string } {
   if (typeof result !== "object" || result === null) {
-    throw new Error(
-      `expected structured { title, output } result, got: ${String(result)}`,
-    )
+    throw new Error(`expected structured result, got: ${String(result)}`)
   }
   return result as { title: string; output: string }
 }
-
-const settle = (ms = 30): Promise<void> =>
-  new Promise((r) => setTimeout(r, ms))
 
 let stateDir: string
 let originalXDG: string | undefined
@@ -148,79 +44,65 @@ afterEach(() => {
   rmSync(stateDir, { recursive: true, force: true })
 })
 
-const TARGET_SERVER_URL = "http://target-daemon:9999"
-
-async function seedTarget(sessionId: string): Promise<void> {
+async function seedTarget(
+  sessionId: string,
+  daemonId: string | undefined = "daemon-target",
+): Promise<void> {
   await upsertEntry({
     sessionId,
-    summary: "test target session",
+    summary: "test target",
     directory: "/tmp/target",
     projectId: "p_target",
-    serverUrl: TARGET_SERVER_URL,
+    serverUrl: "http://localhost:9999",
+    daemonId,
   })
 }
 
 async function seedV1Target(sessionId: string): Promise<void> {
   await upsertEntry({
     sessionId,
-    summary: "v1 test target session (no serverUrl)",
+    summary: "v1 target (no daemonId)",
     directory: "/tmp/target",
     projectId: "p_target",
   })
 }
 
-describe("ask_session tool", () => {
-  test("happy path: factory called with target's serverUrl; happy reply returned", async () => {
+describe("ask_session tool (file-based IPC)", () => {
+  test("happy path: request file written, response file appears → returns reply text", async () => {
     await seedTarget("ses_target")
-    const fake = makeFakeClient()
-    let factoryCalledWith: string | undefined
-    const t = createAskSessionTool((url) => {
-      factoryCalledWith = url
-      return fake.client
-    })
+    const t = createAskSessionTool()
     const promise = t.execute(
-      { sessionId: "ses_target", question: "hello?" },
+      { sessionId: "ses_target", question: "hello?", timeoutMs: 2000 },
       makeFakeCtx(),
     )
-    await settle()
-    fake.addMessage("ses_target", assistantMsg("hi from B", Date.now()))
-    fake.pushEvent({
-      type: "session.idle",
-      properties: { sessionID: "ses_target" },
+    // Simulate the inbox watcher writing a response file after a short delay.
+    await new Promise((r) => setTimeout(r, 200))
+    const { readdir } = await import("node:fs/promises")
+    const files = await readdir(getMessagesDir())
+    const reqFile = files.find((f) => f.endsWith(".req.json"))
+    expect(reqFile).toBeDefined()
+    const requestId = reqFile!.replace(".req.json", "")
+    await writeResponse({
+      requestId,
+      reply: "4",
+      createdAt: Date.now(),
     })
     const result = await promise
-    expect(result).toBe("hi from B")
-    expect(fake.promptCalls).toEqual([
-      { sessionId: "ses_target", text: "hello?" },
-    ])
-    expect(factoryCalledWith).toBe(TARGET_SERVER_URL)
+    expect(result).toBe("4")
   })
 
-  test("self-ask forbidden → text error, factory NOT called", async () => {
-    const fake = makeFakeClient()
-    let factoryCalled = false
-    const t = createAskSessionTool(() => {
-      factoryCalled = true
-      return fake.client
-    })
+  test("self-ask forbidden → text error, no request file written", async () => {
+    const t = createAskSessionTool()
     const result = await t.execute(
       { sessionId: "ses_caller", question: "should not fire" },
       makeFakeCtx({ sessionID: "ses_caller" }),
     )
     const { output } = asStructured(result)
     expect(output).toMatch(/cannot ask yourself/i)
-    expect(output).toMatch(/list_sessions/)
-    expect(fake.promptCalls).toHaveLength(0)
-    expect(factoryCalled).toBe(false)
   })
 
-  test("not in registry → text error, factory NOT called", async () => {
-    const fake = makeFakeClient()
-    let factoryCalled = false
-    const t = createAskSessionTool(() => {
-      factoryCalled = true
-      return fake.client
-    })
+  test("not in registry → text error with list_sessions hint", async () => {
+    const t = createAskSessionTool()
     const result = await t.execute(
       { sessionId: "ses_ghost", question: "hi there" },
       makeFakeCtx(),
@@ -228,85 +110,59 @@ describe("ask_session tool", () => {
     const { output } = asStructured(result)
     expect(output).toMatch(/not in the registry/i)
     expect(output).toMatch(/list_sessions/)
-    expect(fake.promptCalls).toHaveLength(0)
-    expect(factoryCalled).toBe(false)
   })
 
-  test("target registered without serverUrl (v1 entry) → text error advising re-register", async () => {
-    await seedV1Target("ses_v1_target")
-    const fake = makeFakeClient()
-    let factoryCalled = false
-    const t = createAskSessionTool(() => {
-      factoryCalled = true
-      return fake.client
-    })
+  test("v1 target (no daemonId) → text error advising re-register", async () => {
+    await seedV1Target("ses_v1")
+    const t = createAskSessionTool()
     const result = await t.execute(
-      { sessionId: "ses_v1_target", question: "hi there" },
+      { sessionId: "ses_v1", question: "hi there" },
       makeFakeCtx(),
     )
     const { output } = asStructured(result)
     expect(output).toMatch(/older plugin version/i)
     expect(output).toMatch(/register_session again/i)
-    expect(fake.promptCalls).toHaveLength(0)
-    expect(factoryCalled).toBe(false)
   })
 
-  test("session-not-found via promptAsync 404 → text error mentioning deletion + list_sessions", async () => {
+  test("reply timeout: no response file appears → text error 'did not respond'", async () => {
     await seedTarget("ses_target")
-    const fake = makeFakeClient()
-    fake.setPromptError(
-      Object.assign(new Error("Not Found"), { status: 404 }),
-    )
-    const t = createAskSessionTool(() => fake.client)
+    const t = createAskSessionTool()
     const result = await t.execute(
-      { sessionId: "ses_target", question: "hi there" },
-      makeFakeCtx(),
-    )
-    const { output } = asStructured(result)
-    expect(output).toMatch(/does not exist/i)
-    expect(output).toMatch(/list_sessions/)
-  })
-
-  test("reply timeout: no idle event within timeoutMs → text error 'did not respond'", async () => {
-    await seedTarget("ses_target")
-    const fake = makeFakeClient()
-    const t = createAskSessionTool(() => fake.client)
-    const result = await t.execute(
-      { sessionId: "ses_target", question: "hi there", timeoutMs: 100 },
+      { sessionId: "ses_target", question: "hi there", timeoutMs: 300 },
       makeFakeCtx(),
     )
     const { output } = asStructured(result)
     expect(output).toMatch(/did not respond/i)
   })
 
-  test("no-response: idle arrives but reply text is empty → text error 'empty reply'", async () => {
+  test("response file has error field → text error 'target session reported'", async () => {
     await seedTarget("ses_target")
-    const fake = makeFakeClient()
-    const t = createAskSessionTool(() => fake.client)
+    const t = createAskSessionTool()
     const promise = t.execute(
-      { sessionId: "ses_target", question: "hi there", timeoutMs: 500 },
+      { sessionId: "ses_target", question: "hi there", timeoutMs: 2000 },
       makeFakeCtx(),
     )
-    await settle()
-    fake.addMessage("ses_target", {
-      info: { role: "assistant", time: { created: Date.now() } },
-      parts: [{ type: "text", text: "" }],
-    })
-    fake.pushEvent({
-      type: "session.idle",
-      properties: { sessionID: "ses_target" },
+    await new Promise((r) => setTimeout(r, 200))
+    const { readdir } = await import("node:fs/promises")
+    const files = await readdir(getMessagesDir())
+    const reqFile = files.find((f) => f.endsWith(".req.json"))
+    const requestId = reqFile!.replace(".req.json", "")
+    await writeResponse({
+      requestId,
+      error: "LLM errored out on target side",
+      createdAt: Date.now(),
     })
     const result = await promise
     const { output } = asStructured(result)
-    expect(output).toMatch(/empty reply/i)
+    expect(output).toMatch(/target session reported/i)
+    expect(output).toMatch(/LLM errored out/i)
   })
 
   test("abort mid-wait → text error 'aborted', tool never throws", async () => {
     await seedTarget("ses_target")
-    const fake = makeFakeClient()
     const ctrl = new AbortController()
-    setTimeout(() => ctrl.abort(), 30)
-    const t = createAskSessionTool(() => fake.client)
+    setTimeout(() => ctrl.abort(), 50)
+    const t = createAskSessionTool()
     let result: unknown
     let threw = false
     try {
@@ -320,5 +176,26 @@ describe("ask_session tool", () => {
     expect(threw).toBe(false)
     const { output } = asStructured(result)
     expect(output).toMatch(/aborted/i)
+  })
+
+  test("cleanup: request file is deleted after completion", async () => {
+    await seedTarget("ses_target")
+    const t = createAskSessionTool()
+    const promise = t.execute(
+      { sessionId: "ses_target", question: "hello?", timeoutMs: 2000 },
+      makeFakeCtx(),
+    )
+    await new Promise((r) => setTimeout(r, 200))
+    const { readdir } = await import("node:fs/promises")
+    const files = await readdir(getMessagesDir())
+    const reqFile = files.find((f) => f.endsWith(".req.json"))
+    const requestId = reqFile!.replace(".req.json", "")
+    await writeResponse({ requestId, reply: "ok", createdAt: Date.now() })
+    await promise
+    const afterFiles = await readdir(getMessagesDir())
+    const leftover = afterFiles.filter(
+      (f) => f.startsWith(requestId) && !f.endsWith(".tmp"),
+    )
+    expect(leftover).toHaveLength(0)
   })
 })
