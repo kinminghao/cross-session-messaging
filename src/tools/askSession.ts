@@ -13,19 +13,14 @@ import {
 } from "../types.ts"
 
 /**
- * `ask_session` — self-ask guard + timeout clamp + registry pre-check +
- * event-driven send/wait. NEVER throws; every failure branch converts
- * to a readable text output.
- *
- * Rewritten after real-daemon smoke test: dropped the `waitForIdle`
- * pre-poll because opencode SDK's `session.status` is a directory-scoped
- * map, not a per-session lookup. The event stream in `askAndWaitForReply`
- * naturally handles busy-target queueing via loop-wait.
+ * Given the target's daemon URL, produce a client aimed at that daemon.
+ * Production wiring uses `createOpencodeClient` from the SDK; tests
+ * inject a fake that ignores the URL and returns a canned client.
  */
-export type AskSessionClient = AskClient
+export type AskClientFactory = (serverUrl: string) => AskClient
 
 export function createAskSessionTool(
-  client: AskSessionClient,
+  makeClient: AskClientFactory,
 ): ReturnType<typeof tool> {
   return tool({
     description: [
@@ -58,7 +53,6 @@ export function createAskSessionTool(
         ),
     },
     async execute(args, ctx) {
-      // 1. Self-ask check.
       if (args.sessionId === ctx.sessionID) {
         return {
           title: "self-ask forbidden",
@@ -68,17 +62,16 @@ export function createAskSessionTool(
         }
       }
 
-      // 2. Clamp/default budget.
       const budget = Math.min(
         args.timeoutMs ?? DEFAULT_ASK_TIMEOUT_MS,
         MAX_ASK_TIMEOUT_MS,
       )
 
-      // 3. Registry pre-check — produces a better error than letting the
-      //    SDK surface a raw 404.
+      let targetServerUrl: string
       try {
         const reg = await readRegistry()
-        if (!(args.sessionId in reg.sessions)) {
+        const entry = reg.sessions[args.sessionId]
+        if (!entry) {
           return {
             title: "not in registry",
             output:
@@ -86,6 +79,15 @@ export function createAskSessionTool(
               `It may have exited or never registered. Call list_sessions to see current active sessions.`,
           }
         }
+        if (!entry.serverUrl) {
+          return {
+            title: "target has no serverUrl",
+            output:
+              `ask_session error: session ${args.sessionId} was registered by an older plugin version ` +
+              `that did not record its daemon URL. Ask the target session to call register_session again.`,
+          }
+        }
+        targetServerUrl = entry.serverUrl
       } catch (err: unknown) {
         log.warn("ask_session:registry-read-fail", { error: String(err) })
         return {
@@ -97,10 +99,12 @@ export function createAskSessionTool(
         }
       }
 
-      // 4. Send + event-driven wait for reply.
+      // Build a client aimed at the TARGET's daemon, not our own.
+      const targetClient = makeClient(targetServerUrl)
+
       try {
         const reply = await askAndWaitForReply(
-          client,
+          targetClient,
           args.sessionId,
           args.question,
           { timeoutMs: budget, abort: ctx.abort },
@@ -125,8 +129,9 @@ function renderError(
     return {
       title: "session not found",
       output:
-        `ask_session error: session ${sessionId} was found in the registry but the opencode daemon reports it does not exist ` +
-        `(may have been deleted mid-flight). The registry may be stale — call list_sessions again to refresh.`,
+        `ask_session error: session ${sessionId} was found in the registry but its daemon reports the session does not exist ` +
+        `(may have been deleted mid-flight, or the daemon may have restarted). ` +
+        `Call list_sessions to refresh — stale entries auto-prune within 24h.`,
     }
   }
   if (err instanceof AskTimeoutError) {

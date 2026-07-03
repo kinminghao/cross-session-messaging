@@ -17,6 +17,13 @@ export interface RegistryEntry {
   summary: string
   directory: string
   projectId: string
+  /**
+   * HTTP URL of the daemon owning this session's runtime — each opencode
+   * TUI runs its own daemon, so ask_session builds a client against
+   * THIS URL to reach the target. Optional to preserve backwards compat
+   * with pre-multi-daemon registry entries.
+   */
+  serverUrl?: string
   registeredAt: number
   updatedAt: number
 }
