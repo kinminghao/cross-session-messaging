@@ -15,11 +15,15 @@
   "exports": {
     ".": {
       "import": "./src/index.ts"
+    },
+    "./tui": {
+      "import": "./tui.tsx"
     }
   },
   "files": [
     "src",
     "!src/**/*.test.ts",
+    "tui.tsx",
     "README.md",
     "SKILL.md",
     "LICENSE"
@@ -34,7 +38,9 @@
     "prepublishOnly": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.17.4"
+    "@opencode-ai/plugin": "^1.17.4",
+    "@opentui/solid": "^0.4.1",
+    "solid-js": "^1.9.13"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",
