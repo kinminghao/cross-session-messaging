@@ -4,7 +4,7 @@ import { useKeyboard } from "@opentui/solid"
 import type { TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { execSync } from "node:child_process"
 import { PLUGIN_ID } from "./src/constants.ts"
-import { listEntries, upsertEntry } from "./src/registry.ts"
+import { listEntries, removeEntry, upsertEntry } from "./src/registry.ts"
 import type { RegistryEntry } from "./src/types.ts"
 
 function formatAge(ms: number): string {
@@ -52,6 +52,7 @@ function SessionRow(props: {
   entry: RegistryEntry
   selected: boolean
   isSelf: boolean
+  confirming?: boolean
 }) {
   const theme = () => props.api.theme.current
   return (
@@ -69,6 +70,9 @@ function SessionRow(props: {
         <text fg={theme().textMuted}>
           {formatAge(Date.now() - props.entry.updatedAt)} ago
         </text>
+        <Show when={props.confirming}>
+          <text fg={theme().error}>⚠ press delete again to confirm</text>
+        </Show>
       </box>
       <box flexDirection="column" paddingLeft={4}>
         <box flexDirection="row" gap={1}>
@@ -96,9 +100,14 @@ function PeersPanel(props: {
   const api = props.api
   const theme = () => api.theme.current
   const [index, setIndex] = createSignal(0)
+  const [entries, setEntries] = createSignal(props.entries)
+  const [confirmingDelete, setConfirmingDelete] = createSignal<string | null>(
+    null,
+  )
 
   function move(delta: number): void {
-    setIndex((i) => Math.max(0, Math.min(props.entries.length - 1, i + delta)))
+    setConfirmingDelete(null)
+    setIndex((i) => Math.max(0, Math.min(entries().length - 1, i + delta)))
   }
 
   useKeyboard((evt) => {
@@ -123,7 +132,8 @@ function PeersPanel(props: {
     if (evt.name === "return") {
       evt.preventDefault()
       evt.stopPropagation()
-      const entry = props.entries[index()]
+      setConfirmingDelete(null)
+      const entry = entries()[index()]
       if (!entry) return
       const text = formatSessionInfo(entry)
       if (copyToClipboard(text)) {
@@ -137,6 +147,47 @@ function PeersPanel(props: {
           message: "Failed to copy to clipboard.",
         })
       }
+      return
+    }
+    if (evt.name === "backspace" || evt.name === "delete") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      const entry = entries()[index()]
+      if (!entry) return
+      if (confirmingDelete() === entry.sessionId) {
+        void (async () => {
+          try {
+            await removeEntry(entry.sessionId)
+            const updated = entries().filter(
+              (e) => e.sessionId !== entry.sessionId,
+            )
+            setEntries(updated)
+            setConfirmingDelete(null)
+            if (updated.length === 0) {
+              api.ui.dialog.clear()
+              api.ui.toast({
+                variant: "info",
+                message: "No sessions remaining.",
+              })
+              return
+            }
+            setIndex((i) => Math.min(i, updated.length - 1))
+            api.ui.toast({
+              variant: "success",
+              message: `Removed session ${entry.sessionId}`,
+            })
+          } catch (error) {
+            setConfirmingDelete(null)
+            api.ui.toast({
+              variant: "error",
+              message: `Failed to remove: ${error instanceof Error ? error.message : String(error)}`,
+            })
+          }
+        })()
+      } else {
+        setConfirmingDelete(entry.sessionId)
+      }
+      return
     }
   })
 
@@ -151,17 +202,20 @@ function PeersPanel(props: {
     >
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme().text}>
-          <b>Peer Sessions ({props.entries.length})</b>
+          <b>Peer Sessions ({entries().length})</b>
         </text>
-        <text fg={theme().textMuted}>↑↓ navigate · enter copy · esc close</text>
+        <text fg={theme().textMuted}>
+          ↑↓ navigate · ⏎ copy · ⌫ remove · esc close
+        </text>
       </box>
-      <For each={props.entries}>
+      <For each={entries()}>
         {(entry, i) => (
           <SessionRow
             api={api}
             entry={entry}
             selected={i() === index()}
             isSelf={entry.sessionId === props.selfId}
+            confirming={confirmingDelete() === entry.sessionId}
           />
         )}
       </For>
