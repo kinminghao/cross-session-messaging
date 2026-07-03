@@ -1,125 +1,119 @@
-# Cross-Session Messaging — Manual E2E Test Plan
+# 跨会话消息传递 — 手动端到端测试计划
 
-Skeleton per executable plan §T6. Result fields are populated during
-§T17 execution with PASS/FAIL + evidence path from live tmux runs against
-two real opencode sessions.
+按可执行计划 §T6 编写的框架。结果字段在 §T17 执行阶段填入 PASS/FAIL + 来自真实 tmux 运行的证据路径（两个真实 opencode session）。
 
-> The "manual" label refers to running against **real live opencode
-> daemons**, not to human tapping — an agent can execute every step via
-> `interactive_bash` (tmux).
+> 这里的"手动"指的是在**真实的 opencode daemon** 上运行，而非人工点击——agent 可以通过 `interactive_bash`（tmux）执行每一步。
 
-## How to run
+## 如何运行
 
-Spin up two opencode sessions in separate tmux sessions:
+在不同的 tmux session 中启动两个 opencode session：
 
 ```bash
-# Terminal 1 (session A)
+# 终端 1（session A）
 tmux new-session -d -s xsm-A 'cd /tmp/xsm-repoA && opencode'
 
-# Terminal 2 (session B)
+# 终端 2（session B）
 tmux new-session -d -s xsm-B 'cd /tmp/xsm-repoB && opencode'
 ```
 
-Both repos need at least an empty git init. All 5 scenarios use this
-setup; the cross-project scenario needs two different repo paths.
+两个仓库至少需要一个空的 git init。所有 5 个场景都使用此设置；跨项目场景需要两个不同的仓库路径。
 
-Evidence goes under `.sisyphus/evidence/task-17-scenarioN-<slug>.log`
-(tmux capture of both panes).
+证据保存路径：`.sisyphus/evidence/task-17-scenarioN-<slug>.log`（两个窗格的 tmux 截取）。
 
 ---
 
-## Scenario 1: Happy path (same project)
+## 场景 1：正常路径（同一项目）
 
-### Preconditions
-- Registry file `~/.local/state/opencode/agents-registry.json` empty or absent.
-- Session A and Session B both running in the same repo (`/tmp/xsm-happy`).
+### 前置条件
+- Registry 文件 `~/.local/state/opencode/agents-registry.json` 为空或不存在。
+- Session A 和 Session B 都运行在同一个仓库中（`/tmp/xsm-happy`）。
 
-### Setup Commands
+### 设置命令
 ```bash
 mkdir -p /tmp/xsm-happy && cd /tmp/xsm-happy && git init && git commit --allow-empty -m init
 tmux new-session -d -s A 'cd /tmp/xsm-happy && opencode'
 tmux new-session -d -s B 'cd /tmp/xsm-happy && opencode'
 ```
 
-### Steps
-1. In session A: call `register_session` with summary `"session A working on happy-path test"`.
-2. In session B: call `register_session` with summary `"session B ready to answer"`.
-3. In session A: call `list_sessions` — verify B appears with its summary.
-4. In session A: call `ask_session sessionId=<B's id> question="What is 2+2? Answer with just the number, no other text."`.
-5. Wait; A's tool should return with B's reply.
+### 步骤
+1. 在 session A 中：调用 `register_session`，摘要为 `"session A working on happy-path test"`。
+2. 在 session B 中：调用 `register_session`，摘要为 `"session B ready to answer"`。
+3. 在 session A 中：调用 `list_sessions` — 验证 B 出现在列表中并显示其摘要。
+4. 在 session A 中：调用 `ask_session sessionId=<B 的 id> question="What is 2+2? Answer with just the number, no other text."`。
+5. 等待；A 的工具调用应返回 B 的回复。
 
-### Expected Outcome
-A receives a reply string containing `"4"`; the tool call in A takes < 30s end-to-end for this trivial question.
+### 预期结果
+A 收到包含 `"4"` 的回复字符串；对于这个简单问题，工具调用端到端耗时应 < 30 秒。
 
-### Evidence to Capture
-- `.sisyphus/evidence/task-17-scenario1-happy.log` (tmux capture of both panes)
+### 需要采集的证据
+- `.sisyphus/evidence/task-17-scenario1-happy.log`（两个窗格的 tmux 截取）
 
-### Result (filled in during T17)
-- PASS / FAIL: _pending_
+### 结果（在 T17 执行时填写）
+- PASS / FAIL：_待定_
 
 ---
 
-## Scenario 2: Busy-target wait path
+## 场景 2：目标繁忙等待路径
 
-### Preconditions
-- Both sessions running.
-- B will be given a long-running task before A's ask arrives.
+### 前置条件
+- 两个 session 都在运行。
+- 在 A 的提问到达前，B 会被分配一个长时间运行的任务。
 
-### Setup Commands
-Same as Scenario 1.
+### 设置命令
+与场景 1 相同。
 
-### Steps
-1. Both sessions registered.
-2. In session B: send a long-running prompt (e.g. `"read /etc/passwd, count the lines, then write a 500-word explanation of the file format"`) — this occupies B's turn for 30–60s.
-3. While B is still working, in session A: call `ask_session sessionId=<B> question="After you finish your current task, what is the capital of France? Reply with just the city name."`.
-4. Time the interval from A's ask to A's reply.
+### 步骤
+1. 两个 session 都已注册。
+2. 在 session B 中：发送一个长时间运行的 prompt（例如 `"read /etc/passwd, count the lines, then write a 500-word explanation of the file format"`）——这会让 B 忙碌 30–60 秒。
+3. 在 B 仍在工作时，在 session A 中：调用 `ask_session sessionId=<B> question="After you finish your current task, what is the capital of France? Reply with just the city name."`。
+4. 计算从 A 发出提问到 A 收到回复的时间间隔。
 
-### Expected Outcome
-- A's tool call does NOT immediately error — it WAITS for B to finish its current turn.
-- After B finishes and processes A's ask, A receives `"Paris"` (or an equivalent short reply).
-- `time_from_A_ask_to_A_reply >= time_until_B_finishes_original_turn`.
+### 预期结果
+- A 的工具调用**不会**立即报错——它会**等待** B 完成当前任务。
+- B 完成并处理 A 的提问后，A 收到 `"Paris"`（或等价的简短回复）。
+- `A 发问到收到回复的时间 >= B 完成原始任务所需时间`。
 
-### Evidence to Capture
+### 需要采集的证据
 - `.sisyphus/evidence/task-17-scenario2-busywait.log`
 
-### Result (filled in during T17)
-- PASS / FAIL: _pending_
+### 结果（在 T17 执行时填写）
+- PASS / FAIL：_待定_
 
 ---
 
-## Scenario 3: Timeout path
+## 场景 3：超时路径
 
-### Preconditions
-- Session A running.
-- Session B either not responding (stuck in a very long task) or intentionally simulated as stuck.
+### 前置条件
+- Session A 正在运行。
+- Session B 要么无响应（卡在一个很长的任务中），要么被故意模拟为卡住状态。
 
-### Setup Commands
-Same base setup. To simulate a stuck B without a real 30-min task, use a small `timeoutMs` (e.g. `5000`).
+### 设置命令
+基础设置相同。要在不运行真实 30 分钟任务的情况下模拟 B 卡住，可使用较小的 `timeoutMs`（例如 `5000`）。
 
-### Steps
-1. Both sessions registered.
-2. Put B into an intentionally long-running task (e.g. an unbounded loop, or a slow shell command like `sleep 60`).
-3. In session A: call `ask_session sessionId=<B> question="hello?" timeoutMs=5000`.
-4. Verify A's tool returns an error string within ~5–6 seconds.
+### 步骤
+1. 两个 session 都已注册。
+2. 让 B 进入一个故意长时间运行的任务（例如无限循环，或慢速 shell 命令如 `sleep 60`）。
+3. 在 session A 中：调用 `ask_session sessionId=<B> question="hello?" timeoutMs=5000`。
+4. 验证 A 的工具在约 5–6 秒内返回错误字符串。
 
-### Expected Outcome
-A receives a text error containing `"did not respond within 5000ms"` (or `"did not become idle within"` if the busy-wait budget triggered first). No throw. No hang past ~6s.
+### 预期结果
+A 收到包含 `"did not respond within 5000ms"`（或如果繁忙等待预算先触发则为 `"did not become idle within"`）的文本错误。不抛异常。不会挂起超过约 6 秒。
 
-### Evidence to Capture
+### 需要采集的证据
 - `.sisyphus/evidence/task-17-scenario3-timeout.log`
 
-### Result (filled in during T17)
-- PASS / FAIL: _pending_
+### 结果（在 T17 执行时填写）
+- PASS / FAIL：_待定_
 
 ---
 
-## Scenario 4: Cross-project path
+## 场景 4：跨项目路径
 
-### Preconditions
-- Two DIFFERENT git repos: `/tmp/xsm-repoA` and `/tmp/xsm-repoB`.
-- A session running in each.
+### 前置条件
+- 两个**不同的** git 仓库：`/tmp/xsm-repoA` 和 `/tmp/xsm-repoB`。
+- 每个仓库中运行一个 session。
 
-### Setup Commands
+### 设置命令
 ```bash
 mkdir -p /tmp/xsm-repoA /tmp/xsm-repoB
 git -C /tmp/xsm-repoA init && git -C /tmp/xsm-repoA commit --allow-empty -m init
@@ -128,62 +122,62 @@ tmux new-session -d -s A 'cd /tmp/xsm-repoA && opencode'
 tmux new-session -d -s B 'cd /tmp/xsm-repoB && opencode'
 ```
 
-### Steps
-1. Both sessions call `register_session`.
-2. In session A: call `list_sessions` — verify B is present with `directory: /tmp/xsm-repoB` and a `projectId` different from A's.
-3. In session A: call `ask_session sessionId=<B> question="What is 2+2? Reply with just the number."`.
-4. Wait for the reply.
+### 步骤
+1. 两个 session 都调用 `register_session`。
+2. 在 session A 中：调用 `list_sessions` — 验证 B 出现在列表中，`directory` 为 `/tmp/xsm-repoB`，`projectId` 与 A 不同。
+3. 在 session A 中：调用 `ask_session sessionId=<B> question="What is 2+2? Reply with just the number."`。
+4. 等待回复。
 
-### Expected Outcome
-Cross-project ask works exactly like the same-project happy path. A's `list_sessions` shows both entries with distinct `directory` and `projectId`. A receives B's reply.
+### 预期结果
+跨项目提问与同项目正常路径行为完全一致。A 的 `list_sessions` 显示两条记录，具有不同的 `directory` 和 `projectId`。A 收到 B 的回复。
 
-### Evidence to Capture
+### 需要采集的证据
 - `.sisyphus/evidence/task-17-scenario4-crossproject.log`
 
-### Result (filled in during T17)
-- PASS / FAIL: _pending_
+### 结果（在 T17 执行时填写）
+- PASS / FAIL：_待定_
 
 ---
 
-## Scenario 5: Session-not-found path
+## 场景 5：Session 未找到路径
 
-### Preconditions
-- At least session A running and registered.
+### 前置条件
+- 至少 session A 正在运行且已注册。
 
-### Steps
-1. In session A: call `ask_session sessionId=ses_zzz_bogus_9999 question="hi"`.
-2. Read the returned text.
+### 步骤
+1. 在 session A 中：调用 `ask_session sessionId=ses_zzz_bogus_9999 question="hi"`。
+2. 读取返回的文本。
 
-### Expected Outcome
-A receives a text error mentioning:
-- The session is not in the registry (or was deleted).
-- A hint to call `list_sessions` to refresh.
+### 预期结果
+A 收到文本错误，提及：
+- 该 session 不在 registry 中（或已被删除）。
+- 提示调用 `list_sessions` 刷新列表。
 
-No throw. No hang.
+不抛异常。不挂起。
 
-### Evidence to Capture
+### 需要采集的证据
 - `.sisyphus/evidence/task-17-scenario5-notfound.log`
 
-### Result (filled in during T17)
-- PASS / FAIL: _pending_
+### 结果（在 T17 执行时填写）
+- PASS / FAIL：_待定_
 
 ---
 
-## Bonus: `session.deleted` pruning smoke test
+## 附加：`session.deleted` 清理冒烟测试
 
-### Preconditions
-- Scenario 1 or Scenario 4 executed successfully — B is registered.
+### 前置条件
+- 场景 1 或场景 4 已成功执行——B 已注册。
 
-### Steps
-1. Kill session B (Ctrl-C the TUI, or `tmux kill-session -t B`).
-2. Wait 2 seconds.
-3. In session A: call `list_sessions`.
+### 步骤
+1. 终止 session B（Ctrl-C 退出 TUI，或 `tmux kill-session -t B`）。
+2. 等待 2 秒。
+3. 在 session A 中：调用 `list_sessions`。
 
-### Expected Outcome
-Session B is NO LONGER in A's list output — the `session.deleted` hook pruned it. If B still shows, the 24h TTL is the fallback (not a failure of this scenario if the test is run fresh, but the hook itself did not fire).
+### 预期结果
+Session B **不再**出现在 A 的列表输出中——`session.deleted` 钩子已将其清除。如果 B 仍然显示，24 小时 TTL 是兜底机制（如果测试是新运行的，这不算此场景的失败，但说明钩子本身没有触发）。
 
-### Evidence to Capture
+### 需要采集的证据
 - `.sisyphus/evidence/task-17-prune.log`
 
-### Result (filled in during T17)
-- PASS / FAIL: _pending_
+### 结果（在 T17 执行时填写）
+- PASS / FAIL：_待定_
