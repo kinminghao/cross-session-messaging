@@ -8,7 +8,12 @@ import { PLUGIN_ID, RELAY_DEFAULT_PORT } from "./src/constants.ts"
 import { listEntries, removeEntry, upsertEntry } from "./src/registry.ts"
 import type { RegistryEntry } from "./src/types.ts"
 import type { RelayServer } from "./src/relay/server.ts"
-import { getRelayHistory, getRelayUrl, writeRelayUrl } from "./src/config.ts"
+import {
+  clearRelayUrl,
+  getRelayHistory,
+  getRelayUrl,
+  writeRelayUrl,
+} from "./src/config.ts"
 
 let activeRelay: RelayServer | null = null
 
@@ -384,6 +389,8 @@ function RelayStatusPanel(props: {
         activeRelay.stop()
         activeRelay = null
         stopRelayPolling()
+        stopClientPolling()
+        void clearRelayUrl()
         api.ui.dialog.clear()
         api.ui.toast({ variant: "info", message: "Relay server stopped." })
       }
@@ -638,6 +645,9 @@ const plugin: TuiPluginModule = {
                   activeRelay.start()
                   startRelayPolling()
                   const localIp = getLocalIp()
+                  const selfUrl = `http://127.0.0.1:${port}`
+                  await writeRelayUrl(selfUrl)
+                  startClientPolling()
                   api.ui.toast({
                     variant: "success",
                     message: `Relay started on http://${localIp}:${port}`,
