@@ -77,8 +77,7 @@ function updateClientInfo(): void {
     setClientInfo(null)
     return
   }
-  const httpUrl = url.replace(/^ws(s?):\/\//, "http$1://")
-  fetch(`${httpUrl}/stats`)
+  fetch(`${url}/stats`)
     .then((res) => res.json() as Promise<{ peers: PeerGroup[] }>)
     .then((data) => setClientInfo({ url, peers: data.peers }))
     .catch(() => setClientInfo({ url, peers: [] }))
@@ -393,7 +392,7 @@ function RelayStatusPanel(props: {
     if (evt.name === "c") {
       evt.preventDefault()
       evt.stopPropagation()
-      const url = `ws://${props.localIp}:${props.port}`
+      const url = `http://${props.localIp}:${props.port}`
       if (copyToClipboard(url)) {
         api.ui.toast({ variant: "success", message: `Copied: ${url}` })
       }
@@ -417,7 +416,7 @@ function RelayStatusPanel(props: {
         <box flexDirection="row" gap={1}>
           <text fg={theme().textMuted}>Listen:</text>
           <text fg={theme().primary}>
-            ws://{props.localIp}:{props.port}
+            http://{props.localIp}:{props.port}
           </text>
         </box>
       </box>
@@ -438,7 +437,7 @@ function RelayStatusPanel(props: {
       <text fg={theme().textMuted}>c copy URL · s stop · esc close</text>
       <box paddingTop={1}>
         <text fg={theme().textMuted}>
-          On other machines: /join ws://{props.localIp}:{props.port}
+          On other machines: /join http://{props.localIp}:{props.port}
         </text>
       </box>
     </box>
@@ -475,7 +474,7 @@ const plugin: TuiPluginModule = {
                   <b>⚡ Relay :{server!.port}</b>
                 </text>
                 <text fg={theme.textMuted}>
-                  ws://{server!.localIp}:{server!.port}
+                  http://{server!.localIp}:{server!.port}
                 </text>
               </Show>
               <Show when={!server && client}>
@@ -641,7 +640,7 @@ const plugin: TuiPluginModule = {
                   const localIp = getLocalIp()
                   api.ui.toast({
                     variant: "success",
-                    message: `Relay started on ws://${localIp}:${port}`,
+                    message: `Relay started on http://${localIp}:${port}`,
                   })
                 } catch (error) {
                   activeRelay = null
@@ -668,12 +667,12 @@ const plugin: TuiPluginModule = {
             api.ui.dialog.clear()
             const trimmed = url.trim()
             if (
-              !trimmed.startsWith("ws://") &&
-              !trimmed.startsWith("wss://")
+              !trimmed.startsWith("http://") &&
+              !trimmed.startsWith("https://")
             ) {
               api.ui.toast({
                 variant: "error",
-                message: "URL must start with ws:// or wss://",
+                message: "URL must start with http:// or https://",
               })
               return
             }
@@ -714,7 +713,7 @@ const plugin: TuiPluginModule = {
                     api.ui.dialog.replace(() => (
                       <api.ui.DialogPrompt
                         title="Join Relay"
-                        placeholder="ws://192.168.1.100:7351"
+                        placeholder="http://192.168.1.100:7351"
                         onConfirm={(url: string) => void doJoin(url)}
                         onCancel={() => api.ui.dialog.clear()}
                       />
