@@ -3,6 +3,7 @@ import { createSignal, For, onCleanup, Show } from "solid-js"
 import { useKeyboard } from "@opentui/solid"
 import type { TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { execSync } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import { hostname, networkInterfaces } from "node:os"
 import { PLUGIN_ID, RELAY_DEFAULT_PORT } from "./src/constants.ts"
 import { listEntries, removeEntry, upsertEntry } from "./src/registry.ts"
@@ -525,7 +526,24 @@ const plugin: TuiPluginModule = {
         slash: { name: "peers" },
         onSelect: async () => {
           try {
-            const entries = await listEntries()
+            let entries: RegistryEntry[]
+            const relayUrl = getRelayUrl()
+            if (relayUrl) {
+              const res = await fetch(`${relayUrl}/api/list`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  clientId: `tui-peers-${randomUUID().slice(0, 8)}`,
+                  requestId: randomUUID(),
+                }),
+              })
+              const data = (await res.json()) as {
+                entries?: RegistryEntry[]
+              }
+              entries = data.entries ?? []
+            } else {
+              entries = await listEntries()
+            }
             if (entries.length === 0) {
               api.ui.toast({
                 variant: "info",
