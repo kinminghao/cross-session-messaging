@@ -1,12 +1,26 @@
 import type { Server } from "bun"
+import { appendFileSync, mkdirSync } from "node:fs"
+import { dirname, join } from "node:path"
 import { RELAY_DEFAULT_PORT, STALE_ENTRY_TTL_MS } from "../constants.ts"
 import type { RegistryEntry } from "../types.ts"
+import { getStateDir } from "../xdg.ts"
 import type { ServerMessage } from "./protocol.ts"
 
 const CLIENT_STALE_MS = 30_000
 const CLEANUP_INTERVAL_MS = 10_000
 
-const tag = "[relay]"
+let serverLogPath: string | null = null
+function slog(msg: string): void {
+  if (!serverLogPath) {
+    serverLogPath = join(getStateDir(), "cross-session-relay-server.log")
+    mkdirSync(dirname(serverLogPath), { recursive: true })
+  }
+  try {
+    appendFileSync(serverLogPath, `${new Date().toISOString()} ${msg}\n`)
+  } catch {
+    /* ignore */
+  }
+}
 
 interface PendingAsk {
   callerClientId: string
@@ -72,7 +86,7 @@ export class RelayServer {
       () => this.cleanupStaleClients(),
       CLEANUP_INTERVAL_MS,
     )
-    console.log(`${tag} listening on 0.0.0.0:${this.port}`)
+    slog(`[relay] listening on 0.0.0.0:${this.port}`)
   }
 
   stop(): void {
@@ -90,7 +104,7 @@ export class RelayServer {
     this.clientIps.clear()
     this.clientQueues.clear()
     this.pendingAsks.clear()
-    console.log(`${tag} stopped`)
+    slog(`[relay] stopped`)
   }
 
   private async handleRequest(
@@ -118,8 +132,8 @@ export class RelayServer {
       }
 
       if (req.method !== "POST") {
-        console.log(
-          `${tag} rejected ${req.method} ${path} (method not allowed)`,
+        slog(
+          `[relay] rejected ${req.method} ${path} (method not allowed)`,
         )
         return Response.json(
           { error: "method not allowed" },
@@ -131,7 +145,7 @@ export class RelayServer {
       try {
         body = (await req.json()) as Record<string, unknown>
       } catch {
-        console.log(`${tag} rejected POST ${path} (invalid JSON)`)
+        slog(`[relay] rejected POST ${path} (invalid JSON)`)
         return Response.json(
           { error: "invalid JSON body" },
           { status: 400 },
@@ -140,7 +154,7 @@ export class RelayServer {
 
       const clientId = body.clientId as string | undefined
       if (!clientId) {
-        console.log(`${tag} rejected POST ${path} (missing clientId)`)
+        slog(`[relay] rejected POST ${path} (missing clientId)`)
         return Response.json(
           { error: "clientId required" },
           { status: 400 },
@@ -164,12 +178,12 @@ export class RelayServer {
         case "/api/reply":
           return this.handleReply(cid, body)
         default:
-          console.log(`${tag} 404 POST ${path} from ${cid}`)
+          slog(`[relay] 404 POST ${path} from ${cid}`)
           return Response.json({ error: "not found" }, { status: 404 })
       }
     } catch (err) {
-      console.error(
-        `${tag} request error: ${(err as Error).message}`,
+      slog(
+        `[relay] request error: ${(err as Error).message}`,
       )
       return Response.json(
         { error: `internal error: ${(err as Error).message}` },
@@ -199,8 +213,8 @@ export class RelayServer {
     }
     if (isNew) {
       const ip = this.clientIps.get(clientId) ?? "unknown"
-      console.log(
-        `${tag} new client ${clientId.slice(0, 8)} from ${ip} (total=${this.clientLastSeen.size})`,
+      slog(
+        `[relay] new client ${clientId.slice(0, 8)} from ${ip} (total=${this.clientLastSeen.size})`,
       )
     }
   }
@@ -212,8 +226,8 @@ export class RelayServer {
     }
     const messages = [...queue]
     queue.length = 0
-    console.log(
-      `${tag} poll ${clientId.slice(0, 8)} → ${messages.length} msg(s): [${messages.map((m) => m.type).join(", ")}]`,
+    slog(
+      `[relay] poll ${clientId.slice(0, 8)} → ${messages.length} msg(s): [${messages.map((m) => m.type).join(", ")}]`,
     )
     return Response.json({ messages })
   }
@@ -241,8 +255,8 @@ export class RelayServer {
     const oldOwner = this.sessionToClient.get(sessionId)
     if (oldOwner && oldOwner !== clientId) {
       this.clientToSessions.get(oldOwner)?.delete(sessionId)
-      console.log(
-        `${tag} register: session ${sessionId} moved from client ${oldOwner.slice(0, 8)} to ${cid}`,
+      slog(
+        `[relay] register: session ${sessionId} moved from client ${oldOwner.slice(0, 8)} to ${cid}`,
       )
     }
 
@@ -252,8 +266,8 @@ export class RelayServer {
     owned.add(sessionId)
     this.clientToSessions.set(clientId, owned)
 
-    console.log(
-      `${tag} registered ${sessionId} (client=${cid}, device=${entry.deviceName ?? "?"}, sessions=${this.sessions.size})`,
+    slog(
+      `[relay] registered ${sessionId} (client=${cid}, device=${entry.deviceName ?? "?"}, sessions=${this.sessions.size})`,
     )
     return Response.json({ type: "registered", sessionId, entry })
   }
@@ -267,8 +281,8 @@ export class RelayServer {
     const existed = this.sessions.delete(sessionId)
     this.sessionToClient.delete(sessionId)
     this.clientToSessions.get(clientId)?.delete(sessionId)
-    console.log(
-      `${tag} unregistered ${sessionId} (client=${cid}, existed=${existed}, sessions=${this.sessions.size})`,
+    slog(
+      `[relay] unregistered ${sessionId} (client=${cid}, existed=${existed}, sessions=${this.sessions.size})`,
     )
     return Response.json({
       type: "unregistered",
@@ -286,8 +300,8 @@ export class RelayServer {
     const entries = [...this.sessions.values()]
       .filter((e) => e.updatedAt >= cutoff)
       .sort((a, b) => b.updatedAt - a.updatedAt)
-    console.log(
-      `${tag} list (client=${cid}) → ${entries.length} session(s)`,
+    slog(
+      `[relay] list (client=${cid}) → ${entries.length} session(s)`,
     )
     return Response.json({ type: "sessions", requestId, entries })
   }
@@ -299,8 +313,8 @@ export class RelayServer {
     const requestId = body.requestId as string
     const sessionId = body.sessionId as string
     const entry = this.sessions.get(sessionId) ?? null
-    console.log(
-      `${tag} lookup ${sessionId} (client=${cid}) → ${entry ? "found" : "not found"}`,
+    slog(
+      `[relay] lookup ${sessionId} (client=${cid}) → ${entry ? "found" : "not found"}`,
     )
     return Response.json({ type: "looked-up", requestId, entry })
   }
@@ -318,8 +332,8 @@ export class RelayServer {
 
     const targetClientId = this.sessionToClient.get(toSessionId)
     if (!targetClientId) {
-      console.log(
-        `${tag} ask ${rid} from ${cid} → target ${toSessionId} NOT FOUND`,
+      slog(
+        `[relay] ask ${rid} from ${cid} → target ${toSessionId} NOT FOUND`,
       )
       return Response.json({
         ok: false,
@@ -345,8 +359,8 @@ export class RelayServer {
       timeoutMs,
     })
 
-    console.log(
-      `${tag} ask ${rid}: ${fromSessionId} → ${toSessionId} (target-client=${targetClientId.slice(0, 8)}, qLen=${question.length}, timeout=${timeoutMs}ms)`,
+    slog(
+      `[relay] ask ${rid}: ${fromSessionId} → ${toSessionId} (target-client=${targetClientId.slice(0, 8)}, qLen=${question.length}, timeout=${timeoutMs}ms)`,
     )
     return Response.json({ ok: true })
   }
@@ -362,8 +376,8 @@ export class RelayServer {
 
     const pending = this.pendingAsks.get(requestId)
     if (!pending) {
-      console.log(
-        `${tag} reply ${rid} from ${cid} → no pending ask (stale/duplicate)`,
+      slog(
+        `[relay] reply ${rid} from ${cid} → no pending ask (stale/duplicate)`,
       )
       return Response.json({ ok: true })
     }
@@ -376,8 +390,8 @@ export class RelayServer {
       error,
     })
 
-    console.log(
-      `${tag} reply ${rid} from ${cid} → queued to ${pending.callerClientId.slice(0, 8)} (replyLen=${reply?.length ?? 0}, error=${error ?? "none"})`,
+    slog(
+      `[relay] reply ${rid} from ${cid} → queued to ${pending.callerClientId.slice(0, 8)} (replyLen=${reply?.length ?? 0}, error=${error ?? "none"})`,
     )
     return Response.json({ ok: true })
   }
@@ -420,8 +434,8 @@ export class RelayServer {
       this.clientIps.delete(clientId)
       this.clientQueues.delete(clientId)
 
-      console.log(
-        `${tag} cleanup: stale client ${clientId.slice(0, 8)} removed (${owned.size} sessions, remaining clients=${this.clientLastSeen.size})`,
+      slog(
+        `[relay] cleanup: stale client ${clientId.slice(0, 8)} removed (${owned.size} sessions, remaining clients=${this.clientLastSeen.size})`,
       )
     }
   }

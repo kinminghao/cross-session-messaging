@@ -1,41 +1,37 @@
+import { appendFileSync, mkdirSync } from "node:fs"
+import { dirname, join } from "node:path"
 import type { PluginInput } from "@opencode-ai/plugin"
 import { PLUGIN_ID } from "./constants.ts"
+import { getStateDir } from "./xdg.ts"
 
 type Client = PluginInput["client"]
 type Level = "debug" | "info" | "warn" | "error"
 
-// Held so future migrations to opencode's structured logger (writes to
-// ~/.local/share/opencode/log/opencode.log) can pull the SDK client without
-// touching every call-site.
 let client: Client | null = null
+let logPath: string | null = null
 
-/** Attach the in-process opencode SDK client. Called once from `src/index.ts`. */
+function getLogPath(): string {
+  if (!logPath) {
+    logPath = join(getStateDir(), "cross-session-messaging.log")
+    mkdirSync(dirname(logPath), { recursive: true })
+  }
+  return logPath
+}
+
 export function initLogger(c: Client): void {
   client = c
 }
 
-/**
- * Emit a log line. Every line is prefixed with PLUGIN_ID so the whole
- * plugin's activity is greppable in `opencode.log`.
- *
- * TODO(scaffold): the opencode plugin API doesn't expose a `client.log.*`
- * surface as of @opencode-ai/plugin@1.17.x, so this writes to stderr for
- * now — the opencode daemon captures stderr into its logfile. Revisit if
- * a first-class logging hook lands.
- */
 function emit(level: Level, tag: string, extra?: unknown): void {
   const payload = extra === undefined ? "" : ` ${safeStringify(extra)}`
-  const line = `${PLUGIN_ID}: ${tag}${payload}`
-  const fn: (...args: unknown[]) => void =
-    level === "error"
-      ? console.error
-      : level === "warn"
-        ? console.warn
-        : level === "debug"
-          ? console.debug
-          : console.log
-  fn(`[${level}] ${line}`)
-  void client // reserved for structured-log migration
+  const ts = new Date().toISOString()
+  const line = `${ts} [${level}] ${PLUGIN_ID}: ${tag}${payload}\n`
+  try {
+    appendFileSync(getLogPath(), line)
+  } catch {
+    /* ignore write failures */
+  }
+  void client
 }
 
 function safeStringify(value: unknown): string {
@@ -44,6 +40,10 @@ function safeStringify(value: unknown): string {
   } catch {
     return String(value)
   }
+}
+
+export function getLogFilePath(): string {
+  return getLogPath()
 }
 
 export const log = {
