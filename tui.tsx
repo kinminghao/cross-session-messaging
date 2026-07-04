@@ -154,6 +154,7 @@ function shortDir(dir: string): string {
 
 const VIEWPORT_ROWS = 40
 const EXPANDED_EXTRA = 7
+const LINE_WIDTH = 72
 
 interface VLine {
   text: string
@@ -251,17 +252,17 @@ function PeersPanel(props: {
       const age = formatAge(Date.now() - e.updatedAt)
       const del = confirmingDelete() === e.sessionId ? " ⚠ delete?" : ""
       lines.push({
-        text: `${arrow} ${title}${self}  ${dir}  ${age}${del}`,
+        text: truncate(`${arrow} ${title}${self}  ${dir}  ${age}${del}`, LINE_WIDTH),
         style: sel ? "selected" : "normal",
       })
       if (exp) {
         const details: string[] = [
-          `    ID:  ${e.sessionId}`,
-          `    Sum: ${truncate(e.summary, 70)}`,
-          `    Dir: ${truncate(e.directory, 70)}`,
-          `    Prj: ${truncate(e.projectId, 50)}`,
-          `    Dev: ${e.deviceName ?? "unknown"}`,
-          `    Srv: ${truncate(e.serverUrl ?? "", 50)}`,
+          truncate(`    ID:  ${e.sessionId}`, LINE_WIDTH),
+          truncate(`    Sum: ${e.summary}`, LINE_WIDTH),
+          truncate(`    Dir: ${e.directory}`, LINE_WIDTH),
+          truncate(`    Prj: ${e.projectId}`, LINE_WIDTH),
+          truncate(`    Dev: ${e.deviceName ?? "unknown"}`, LINE_WIDTH),
+          truncate(`    Srv: ${e.serverUrl ?? ""}`, LINE_WIDTH),
           "",
         ]
         for (const d of details) lines.push({ text: d, style: "muted" })
