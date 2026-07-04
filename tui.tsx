@@ -163,43 +163,30 @@ function SessionRow(props: {
 }) {
   const theme = () => props.api.theme.current
   const e = props.entry
-  const arrow = () =>
-    props.selected ? (props.expanded ? "▼" : "▶") : " "
+  const compactLine = () => {
+    const arrow = props.selected ? (props.expanded ? "▼" : "▶") : " "
+    const title = truncate(e.summary || e.sessionId, 36)
+    const self = props.isSelf ? " ★" : ""
+    const dir = shortDir(e.directory)
+    const age = formatAge(Date.now() - e.updatedAt)
+    const del = props.confirming ? " ⚠ delete?" : ""
+    return `${arrow} ${title}${self}  ${dir}  ${age}${del}`
+  }
   return (
     <box flexDirection="column">
-      <box flexDirection="row" gap={1}>
-        <text fg={props.selected ? theme().primary : theme().textMuted}>
-          {arrow()}
-        </text>
-        <text fg={props.selected ? theme().primary : theme().text}>
-          {truncate(e.summary || e.sessionId, 40)}
-        </text>
-        <Show when={props.isSelf}>
-          <text fg={theme().success}>★</text>
-        </Show>
-        <text fg={theme().textMuted}>{shortDir(e.directory)}</text>
-        <text fg={theme().textMuted}>
-          {formatAge(Date.now() - e.updatedAt)}
-        </text>
-        <Show when={props.confirming}>
-          <text fg={theme().error}>⚠ delete?</text>
-        </Show>
-      </box>
+      <text fg={props.selected ? theme().primary : theme().text}>
+        {compactLine()}
+      </text>
       <Show when={props.expanded}>
-        <box flexDirection="column" paddingLeft={4}>
-          <text fg={theme().textMuted}>
-            {`ID:  ${e.sessionId}`}
-          </text>
-          <text fg={theme().text}>
-            {`Sum: ${truncate(e.summary, 60)}`}
-          </text>
-          <text fg={theme().textMuted}>
-            {`Dir: ${truncate(e.directory, 60)}`}
-          </text>
-          <text fg={theme().textMuted}>
-            {`Prj: ${truncate(e.projectId, 40)}`}
-          </text>
-        </box>
+        <text fg={theme().textMuted}>
+          {`    ID:  ${e.sessionId}`}
+        </text>
+        <text fg={theme().textMuted}>
+          {`    Dir: ${truncate(e.directory, 60)}`}
+        </text>
+        <text fg={theme().textMuted}>
+          {`    Prj: ${truncate(e.projectId, 40)}`}
+        </text>
       </Show>
     </box>
   )
