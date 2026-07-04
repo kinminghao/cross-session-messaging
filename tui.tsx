@@ -156,27 +156,60 @@ function SessionRow(props: {
   api: TuiPluginApi
   entry: RegistryEntry
   selected: boolean
+  expanded: boolean
   isSelf: boolean
   isRemote: boolean
   confirming?: boolean
 }) {
   const theme = () => props.api.theme.current
   const e = props.entry
+  const arrow = () =>
+    props.selected ? (props.expanded ? "▼" : "▶") : " "
   return (
-    <box flexDirection="row" gap={1}>
-      <text fg={props.selected ? theme().primary : theme().textMuted}>
-        {props.selected ? "▶" : " "}
-      </text>
-      <text fg={props.selected ? theme().primary : theme().text}>
-        {truncate(e.summary || e.sessionId, 40)}
-      </text>
-      <Show when={props.isSelf}>
-        <text fg={theme().success}>★</text>
-      </Show>
-      <text fg={theme().textMuted}>{shortDir(e.directory)}</text>
-      <text fg={theme().textMuted}>{formatAge(Date.now() - e.updatedAt)}</text>
-      <Show when={props.confirming}>
-        <text fg={theme().error}>⚠ delete?</text>
+    <box flexDirection="column">
+      <box flexDirection="row" gap={1}>
+        <text fg={props.selected ? theme().primary : theme().textMuted}>
+          {arrow()}
+        </text>
+        <text fg={props.selected ? theme().primary : theme().text}>
+          {truncate(e.summary || e.sessionId, 40)}
+        </text>
+        <Show when={props.isSelf}>
+          <text fg={theme().success}>★</text>
+        </Show>
+        <text fg={theme().textMuted}>{shortDir(e.directory)}</text>
+        <text fg={theme().textMuted}>
+          {formatAge(Date.now() - e.updatedAt)}
+        </text>
+        <Show when={props.confirming}>
+          <text fg={theme().error}>⚠ delete?</text>
+        </Show>
+      </box>
+      <Show when={props.expanded}>
+        <box flexDirection="column" paddingLeft={4}>
+          <box flexDirection="row" gap={1}>
+            <text fg={theme().textMuted}>ID:</text>
+            <text fg={theme().text}>{e.sessionId}</text>
+          </box>
+          <box flexDirection="row" gap={1}>
+            <text fg={theme().textMuted}>Summary:</text>
+            <text fg={theme().text}>{e.summary}</text>
+          </box>
+          <box flexDirection="row" gap={1}>
+            <text fg={theme().textMuted}>Dir:</text>
+            <text fg={theme().text}>{e.directory}</text>
+          </box>
+          <box flexDirection="row" gap={1}>
+            <text fg={theme().textMuted}>Project:</text>
+            <text fg={theme().text}>{e.projectId}</text>
+          </box>
+          <Show when={e.deviceName}>
+            <box flexDirection="row" gap={1}>
+              <text fg={theme().textMuted}>Device:</text>
+              <text fg={theme().text}>{e.deviceName}</text>
+            </box>
+          </Show>
+        </box>
       </Show>
     </box>
   )
@@ -209,9 +242,20 @@ function PeersPanel(props: {
   const [entries, setEntries] = createSignal(props.entries)
   const [tabIndex, setTabIndex] = createSignal(0)
   const [rowIndex, setRowIndex] = createSignal(0)
+  const [expandedIds, setExpandedIds] = createSignal<Set<string>>(new Set())
   const [confirmingDelete, setConfirmingDelete] = createSignal<string | null>(
     null,
   )
+
+  function toggleExpand(sessionId: string, force?: boolean): void {
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      const shouldExpand = force ?? !next.has(sessionId)
+      if (shouldExpand) next.add(sessionId)
+      else next.delete(sessionId)
+      return next
+    })
+  }
 
   function devices() {
     const seen = new Map<string, RegistryEntry[]>()
@@ -267,6 +311,22 @@ function PeersPanel(props: {
       evt.preventDefault()
       evt.stopPropagation()
       moveRow(1)
+      return
+    }
+    if (evt.name === "right" || evt.name === "l") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      const tab = currentTab()
+      const entry = tab?.items[rowIndex()]
+      if (entry) toggleExpand(entry.sessionId, true)
+      return
+    }
+    if (evt.name === "left" || evt.name === "h") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      const tab = currentTab()
+      const entry = tab?.items[rowIndex()]
+      if (entry) toggleExpand(entry.sessionId, false)
       return
     }
     if (evt.name === "return") {
@@ -357,7 +417,7 @@ function PeersPanel(props: {
           <b>Peer Sessions ({entries().length})</b>
         </text>
         <text fg={theme().textMuted}>
-          tab switch · ↑↓ navigate · ⏎ copy · ⌫ remove · esc close
+          tab switch · ↑↓ navigate · ←→ fold · ⏎ copy · ⌫ del · esc
         </text>
       </box>
 
@@ -386,6 +446,7 @@ function PeersPanel(props: {
               api={api}
               entry={entry}
               selected={ri() === rowIndex()}
+              expanded={expandedIds().has(entry.sessionId)}
               isSelf={entry.sessionId === props.selfId}
               isRemote={
                 !!entry.deviceName && entry.deviceName !== localDevice
