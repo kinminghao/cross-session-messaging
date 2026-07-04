@@ -10,6 +10,7 @@ import { listEntries, removeEntry, upsertEntry } from "./src/registry.ts"
 import type { RegistryEntry } from "./src/types.ts"
 import type { RelayServer } from "./src/relay/server.ts"
 import {
+  addSuppressedSession,
   clearRelayUrl,
   getRelayHistory,
   getRelayUrl,
@@ -162,6 +163,7 @@ interface VLine {
 }
 
 async function deleteSession(sessionId: string): Promise<void> {
+  addSuppressedSession(sessionId)
   const relayUrl = getRelayUrl()
   if (relayUrl) {
     const res = await fetch(`${relayUrl}/api/unregister`, {

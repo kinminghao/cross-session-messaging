@@ -1,9 +1,10 @@
-import { readFileSync } from "node:fs"
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs"
 import { promises as fs } from "node:fs"
 import { dirname, join } from "node:path"
 import { getStateDir } from "./xdg.ts"
 
 const RELAY_CONFIG_FILENAME = "cross-session-relay.json"
+const SUPPRESSION_FILENAME = "cross-session-suppressed.json"
 
 interface RelayConfig {
   current: string | null
@@ -65,4 +66,31 @@ export async function clearRelayUrl(): Promise<void> {
   const config = readConfig()
   config.current = null
   await writeConfig(config)
+}
+
+function getSuppressionPath(): string {
+  return join(getStateDir(), SUPPRESSION_FILENAME)
+}
+
+export function readSuppressedSessions(): Set<string> {
+  try {
+    const raw = readFileSync(getSuppressionPath(), "utf8")
+    return new Set(JSON.parse(raw) as string[])
+  } catch {
+    return new Set()
+  }
+}
+
+export function addSuppressedSession(sessionId: string): void {
+  const set = readSuppressedSessions()
+  set.add(sessionId)
+  writeFileSync(getSuppressionPath(), JSON.stringify([...set]))
+}
+
+export function clearSuppressedSessions(): void {
+  try {
+    unlinkSync(getSuppressionPath())
+  } catch {
+    /* ignore */
+  }
 }

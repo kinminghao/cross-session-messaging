@@ -3,7 +3,12 @@ import { tool } from "@opencode-ai/plugin/tool"
 import { randomUUID } from "node:crypto"
 import { hostname } from "node:os"
 import { askAndWaitForReply, type AskClient } from "./askAndWaitForReply.ts"
-import { getRelayUrl, writeRelayUrl } from "./config.ts"
+import {
+  clearSuppressedSessions,
+  getRelayUrl,
+  readSuppressedSessions,
+  writeRelayUrl,
+} from "./config.ts"
 import { PLUGIN_ID, SESSION_DISCOVERY_MS } from "./constants.ts"
 import { createEventHandler } from "./eventHooks.ts"
 import { initLogger, log } from "./logger.ts"
@@ -52,6 +57,8 @@ const plugin: PluginModule = {
       askAndWaitForReply(client, sessionId, question, opts),
     )
 
+    clearSuppressedSessions()
+
     interface DiscoveredSession {
       id: string
       title: string
@@ -67,9 +74,11 @@ const plugin: PluginModule = {
           responseStyle: "data",
         })) as unknown as DiscoveredSession[]
 
+        const suppressed = readSuppressedSessions()
         const currentIds = new Set<string>()
         for (const s of sessions) {
           currentIds.add(s.id)
+          if (suppressed.has(s.id)) continue
           try {
             await transport.register({
               sessionId: s.id,
