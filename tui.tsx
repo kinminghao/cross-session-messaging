@@ -14,6 +14,7 @@ import {
   clearRelayUrl,
   getRelayHistory,
   getRelayUrl,
+  readSuppressedSessions,
   writeRelayUrl,
 } from "./src/config.ts"
 
@@ -618,6 +619,10 @@ const plugin: TuiPluginModule = {
               entries = data.entries ?? []
             } else {
               entries = await listEntries()
+            }
+            const suppressed = readSuppressedSessions()
+            if (suppressed.size > 0) {
+              entries = entries.filter((e) => !suppressed.has(e.sessionId))
             }
             if (entries.length === 0) {
               api.ui.toast({
