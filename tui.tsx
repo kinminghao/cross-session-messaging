@@ -192,6 +192,22 @@ function SessionRow(props: {
   )
 }
 
+async function deleteSession(sessionId: string): Promise<void> {
+  const relayUrl = getRelayUrl()
+  if (relayUrl) {
+    const res = await fetch(`${relayUrl}/api/unregister`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        clientId: `tui-delete-${randomUUID().slice(0, 8)}`,
+        sessionId,
+      }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  }
+  await removeEntry(sessionId)
+}
+
 function PeersPanel(props: {
   api: TuiPluginApi
   entries: RegistryEntry[]
@@ -200,19 +216,42 @@ function PeersPanel(props: {
   const api = props.api
   const theme = () => api.theme.current
   const localDevice = hostname()
-  const [index, setIndex] = createSignal(0)
   const [entries, setEntries] = createSignal(props.entries)
+  const [tabIndex, setTabIndex] = createSignal(0)
+  const [rowIndex, setRowIndex] = createSignal(0)
   const [confirmingDelete, setConfirmingDelete] = createSignal<string | null>(
     null,
   )
 
-  function isRemote(entry: RegistryEntry): boolean {
-    return !!entry.deviceName && entry.deviceName !== localDevice
+  function devices() {
+    const seen = new Map<string, RegistryEntry[]>()
+    for (const e of entries()) {
+      const dev = e.deviceName ?? "unknown"
+      const arr = seen.get(dev)
+      if (arr) arr.push(e)
+      else seen.set(dev, [e])
+    }
+    return [...seen.entries()].map(([name, items]) => ({ name, items }))
   }
 
-  function move(delta: number): void {
+  function currentTab() {
+    const devs = devices()
+    return devs[tabIndex()] ?? devs[0]
+  }
+
+  function switchTab(delta: number): void {
+    const devs = devices()
+    if (devs.length === 0) return
+    setTabIndex((i) => ((i + delta) % devs.length + devs.length) % devs.length)
+    setRowIndex(0)
     setConfirmingDelete(null)
-    setIndex((i) => Math.max(0, Math.min(entries().length - 1, i + delta)))
+  }
+
+  function moveRow(delta: number): void {
+    const tab = currentTab()
+    if (!tab) return
+    setConfirmingDelete(null)
+    setRowIndex((i) => Math.max(0, Math.min(tab.items.length - 1, i + delta)))
   }
 
   useKeyboard((evt) => {
@@ -222,23 +261,30 @@ function PeersPanel(props: {
       api.ui.dialog.clear()
       return
     }
+    if (evt.name === "tab") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      switchTab(evt.shift ? -1 : 1)
+      return
+    }
     if (evt.name === "up" || evt.name === "k") {
       evt.preventDefault()
       evt.stopPropagation()
-      move(-1)
+      moveRow(-1)
       return
     }
     if (evt.name === "down" || evt.name === "j") {
       evt.preventDefault()
       evt.stopPropagation()
-      move(1)
+      moveRow(1)
       return
     }
     if (evt.name === "return") {
       evt.preventDefault()
       evt.stopPropagation()
       setConfirmingDelete(null)
-      const entry = entries()[index()]
+      const tab = currentTab()
+      const entry = tab?.items[rowIndex()]
       if (!entry) return
       const text = formatSessionInfo(entry)
       if (copyToClipboard(text)) {
@@ -257,12 +303,13 @@ function PeersPanel(props: {
     if (evt.name === "backspace" || evt.name === "delete") {
       evt.preventDefault()
       evt.stopPropagation()
-      const entry = entries()[index()]
+      const tab = currentTab()
+      const entry = tab?.items[rowIndex()]
       if (!entry) return
       if (confirmingDelete() === entry.sessionId) {
         void (async () => {
           try {
-            await removeEntry(entry.sessionId)
+            await deleteSession(entry.sessionId)
             const updated = entries().filter(
               (e) => e.sessionId !== entry.sessionId,
             )
@@ -276,7 +323,17 @@ function PeersPanel(props: {
               })
               return
             }
-            setIndex((i) => Math.min(i, updated.length - 1))
+            const newTab = (() => {
+              const devs = [...new Map(
+                updated.map((e) => [e.deviceName ?? "unknown", true]),
+              ).keys()]
+              if (tabIndex() >= devs.length) setTabIndex(devs.length - 1)
+              return devs[tabIndex()]
+            })()
+            const tabItems = updated.filter(
+              (e) => (e.deviceName ?? "unknown") === newTab,
+            )
+            setRowIndex((i) => Math.min(i, Math.max(0, tabItems.length - 1)))
             api.ui.toast({
               variant: "success",
               message: `Removed session ${entry.sessionId}`,
@@ -296,9 +353,6 @@ function PeersPanel(props: {
     }
   })
 
-  const localEntries = () => entries().filter((e) => !isRemote(e))
-  const remoteEntries = () => entries().filter((e) => isRemote(e))
-
   return (
     <box
       paddingTop={1}
@@ -313,51 +367,44 @@ function PeersPanel(props: {
           <b>Peer Sessions ({entries().length})</b>
         </text>
         <text fg={theme().textMuted}>
-          ↑↓ navigate · ⏎ copy · ⌫ remove · esc close
+          tab switch · ↑↓ navigate · ⏎ copy · ⌫ remove · esc close
         </text>
       </box>
 
-      <Show when={localEntries().length > 0}>
-        <text fg={theme().textMuted}>
-          <b>Local ({localDevice})</b>
-        </text>
-      </Show>
-      <For each={localEntries()}>
-        {(entry) => {
-          const myIdx = entries().indexOf(entry)
-          return (
-            <SessionRow
-              api={api}
-              entry={entry}
-              selected={myIdx === index()}
-              isSelf={entry.sessionId === props.selfId}
-              isRemote={false}
-              confirming={confirmingDelete() === entry.sessionId}
-            />
-          )
-        }}
-      </For>
+      <box flexDirection="row" gap={2}>
+        <For each={devices()}>
+          {(dev, di) => {
+            const isActive = () => di() === tabIndex()
+            const isLocal = dev.name === localDevice
+            return (
+              <text
+                fg={isActive() ? theme().primary : theme().textMuted}
+              >
+                {isActive() ? "▸ " : "  "}
+                {isLocal ? `${dev.name} (local)` : dev.name}
+                {` (${dev.items.length})`}
+              </text>
+            )
+          }}
+        </For>
+      </box>
 
-      <Show when={remoteEntries().length > 0}>
-        <text fg={theme().info}>
-          <b>Remote</b>
-        </text>
-      </Show>
-      <For each={remoteEntries()}>
-        {(entry) => {
-          const myIdx = entries().indexOf(entry)
-          return (
+      <box flexDirection="column" overflow="scroll" maxHeight={20}>
+        <For each={currentTab()?.items ?? []}>
+          {(entry, ri) => (
             <SessionRow
               api={api}
               entry={entry}
-              selected={myIdx === index()}
+              selected={ri() === rowIndex()}
               isSelf={entry.sessionId === props.selfId}
-              isRemote={true}
+              isRemote={
+                !!entry.deviceName && entry.deviceName !== localDevice
+              }
               confirming={confirmingDelete() === entry.sessionId}
             />
-          )
-        }}
-      </For>
+          )}
+        </For>
+      </box>
     </box>
   )
 }
