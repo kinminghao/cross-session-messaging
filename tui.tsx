@@ -551,8 +551,8 @@ const plugin: TuiPluginModule = {
           return (
             <box flexDirection="column" paddingLeft={1} paddingBottom={1}>
               <Show when={server}>
-                <text fg={theme.primary}>
-                  <b>⚡ Relay :{server!.port}</b>
+                <text fg={theme.success}>
+                  <b>⚡ SERVER :{server!.port}</b>
                 </text>
                 <text fg={theme.textMuted}>
                   http://{server!.localIp}:{server!.port}
@@ -560,7 +560,7 @@ const plugin: TuiPluginModule = {
               </Show>
               <Show when={!server && client}>
                 <text fg={theme.primary}>
-                  <b>⚡ Relay</b>
+                  <b>⚡ CLIENT</b>
                 </text>
                 <text fg={theme.textMuted}>{client!.url}</text>
               </Show>
