@@ -91,16 +91,16 @@ const plugin: PluginModule = {
               .string()
               .min(5)
               .describe(
-                "WebSocket URL of the relay server (e.g. ws://192.168.1.100:7351).",
+                "HTTP URL of the relay server (e.g. http://192.168.1.100:7351).",
               ),
           },
           async execute(args) {
             const url = args.url.trim()
-            if (!url.startsWith("ws://") && !url.startsWith("wss://")) {
+            if (!url.startsWith("http://") && !url.startsWith("https://")) {
               return {
                 title: "invalid URL",
                 output:
-                  "connect_relay error: URL must start with ws:// or wss://",
+                  "connect_relay error: URL must start with http:// or https://",
               }
             }
             try {

@@ -49,3 +49,6 @@ export const INBOX_REQUEST_TIMEOUT_MS = 5 * 60_000
 export const RELAY_DEFAULT_PORT = 7351
 export const RELAY_RECONNECT_MS = 3_000
 export const RELAY_RECONNECT_MAX_MS = 30_000
+
+/** HTTP polling interval for relay transport (max 1 request per second). */
+export const RELAY_HTTP_POLL_MS = 1_000

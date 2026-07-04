@@ -1,12 +1,13 @@
-import type { Server, ServerWebSocket } from "bun"
+import type { Server } from "bun"
 import { RELAY_DEFAULT_PORT, STALE_ENTRY_TTL_MS } from "../constants.ts"
 import type { RegistryEntry } from "../types.ts"
-import type { ClientMessage, ServerMessage } from "./protocol.ts"
+import type { ServerMessage } from "./protocol.ts"
 
-type WS = ServerWebSocket<undefined>
+const CLIENT_STALE_MS = 30_000
+const CLEANUP_INTERVAL_MS = 10_000
 
 interface PendingAsk {
-  caller: WS
+  callerClientId: string
   targetSessionId: string
 }
 
@@ -14,25 +15,36 @@ export class RelayServer {
   readonly port: number
   private server: Server<undefined> | null = null
   private readonly sessions = new Map<string, RegistryEntry>()
-  private readonly sessionToWs = new Map<string, WS>()
-  private readonly wsToSessions = new Map<WS, Set<string>>()
+  private readonly sessionToClient = new Map<string, string>()
+  private readonly clientToSessions = new Map<string, Set<string>>()
+  private readonly clientLastSeen = new Map<string, number>()
+  private readonly clientIps = new Map<string, string>()
+  private readonly clientQueues = new Map<string, ServerMessage[]>()
   private readonly pendingAsks = new Map<string, PendingAsk>()
-  private readonly clients = new Set<WS>()
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null
 
   constructor(port: number = RELAY_DEFAULT_PORT) {
     this.port = port
   }
 
   get connectedClients(): number {
-    return this.clients.size
+    const cutoff = Date.now() - CLIENT_STALE_MS
+    let count = 0
+    for (const ts of this.clientLastSeen.values()) {
+      if (ts >= cutoff) count++
+    }
+    return count
   }
 
   get clientDetails(): Array<{ ip: string; sessions: string[] }> {
+    const cutoff = Date.now() - CLIENT_STALE_MS
     const details: Array<{ ip: string; sessions: string[] }> = []
-    for (const [ws, sessionIds] of this.wsToSessions) {
+    for (const [cid, ts] of this.clientLastSeen) {
+      if (ts < cutoff) continue
+      const sids = this.clientToSessions.get(cid)
       details.push({
-        ip: ws.remoteAddress,
-        sessions: [...sessionIds],
+        ip: this.clientIps.get(cid) ?? "unknown",
+        sessions: sids ? [...sids] : [],
       })
     }
     return details
@@ -52,213 +64,306 @@ export class RelayServer {
     this.server = Bun.serve({
       port: this.port,
       hostname: "0.0.0.0",
-      fetch: (req, server) => {
-        if (new URL(req.url).pathname === "/stats") {
-          return Response.json({ peers: this.peersByDevice })
-        }
-        if (server.upgrade(req)) return
-        return new Response("relay: websocket only", { status: 426 })
-      },
-      websocket: {
-        open: (ws) => this.handleOpen(ws),
-        message: (ws, data) => this.handleMessage(ws, data),
-        close: (ws) => this.handleClose(ws),
-      },
+      fetch: (req, server) => this.handleRequest(req, server),
     })
+    this.cleanupTimer = setInterval(
+      () => this.cleanupStaleClients(),
+      CLEANUP_INTERVAL_MS,
+    )
     console.log(`[relay] listening on 0.0.0.0:${this.port}`)
   }
 
   stop(): void {
     if (!this.server) return
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer)
+      this.cleanupTimer = null
+    }
     this.server.stop(true)
     this.server = null
     this.sessions.clear()
-    this.sessionToWs.clear()
-    this.wsToSessions.clear()
+    this.sessionToClient.clear()
+    this.clientToSessions.clear()
+    this.clientLastSeen.clear()
+    this.clientIps.clear()
+    this.clientQueues.clear()
     this.pendingAsks.clear()
-    this.clients.clear()
     console.log("[relay] stopped")
   }
 
-  private handleOpen(ws: WS): void {
-    this.clients.add(ws)
-    this.wsToSessions.set(ws, new Set<string>())
-    console.log(`[relay] client connected (total=${this.clients.size})`)
-  }
-
-  private handleClose(ws: WS): void {
-    const owned = this.wsToSessions.get(ws) ?? new Set<string>()
-    for (const sid of owned) {
-      this.sessions.delete(sid)
-      this.sessionToWs.delete(sid)
-    }
-    this.wsToSessions.delete(ws)
-    for (const [reqId, pending] of this.pendingAsks) {
-      if (pending.caller === ws) {
-        this.pendingAsks.delete(reqId)
-      } else if (owned.has(pending.targetSessionId)) {
-        this.send(pending.caller, {
-          type: "reply",
-          requestId: reqId,
-          error: `Target session ${pending.targetSessionId} disconnected`,
-        })
-        this.pendingAsks.delete(reqId)
-      }
-    }
-    this.clients.delete(ws)
-    console.log(`[relay] client disconnected (total=${this.clients.size})`)
-  }
-
-  private handleMessage(ws: WS, data: string | Buffer): void {
-    let msg: ClientMessage
+  private async handleRequest(
+    req: Request,
+    server: Server<undefined>,
+  ): Promise<Response> {
     try {
-      const text = typeof data === "string" ? data : data.toString("utf8")
-      msg = JSON.parse(text) as ClientMessage
-    } catch (err) {
-      this.send(ws, {
-        type: "error",
-        message: `invalid JSON: ${(err as Error).message}`,
-      })
-      return
-    }
-    switch (msg.type) {
-      case "register":
-        this.onRegister(ws, msg)
-        return
-      case "unregister":
-        this.onUnregister(ws, msg)
-        return
-      case "list":
-        this.onList(ws, msg)
-        return
-      case "lookup":
-        this.onLookup(ws, msg)
-        return
-      case "ask":
-        this.onAsk(ws, msg)
-        return
-      case "reply":
-        this.onReply(msg)
-        return
-      default: {
-        const _exhaustive: never = msg
-        void _exhaustive
+      const url = new URL(req.url)
+      const path = url.pathname
+
+      if (path === "/stats" && req.method === "GET") {
+        return Response.json({ peers: this.peersByDevice })
       }
+
+      if (path === "/api/poll" && req.method === "GET") {
+        const clientId = url.searchParams.get("clientId")
+        if (!clientId) {
+          return Response.json(
+            { error: "clientId required" },
+            { status: 400 },
+          )
+        }
+        this.touchClient(clientId, req, server)
+        return this.handlePoll(clientId)
+      }
+
+      if (req.method !== "POST") {
+        return Response.json(
+          { error: "method not allowed" },
+          { status: 405 },
+        )
+      }
+
+      let body: Record<string, unknown>
+      try {
+        body = (await req.json()) as Record<string, unknown>
+      } catch {
+        return Response.json(
+          { error: "invalid JSON body" },
+          { status: 400 },
+        )
+      }
+
+      const clientId = body.clientId as string | undefined
+      if (!clientId) {
+        return Response.json(
+          { error: "clientId required" },
+          { status: 400 },
+        )
+      }
+
+      this.touchClient(clientId, req, server)
+
+      switch (path) {
+        case "/api/register":
+          return this.handleRegister(clientId, body)
+        case "/api/unregister":
+          return this.handleUnregister(clientId, body)
+        case "/api/list":
+          return this.handleList(body)
+        case "/api/lookup":
+          return this.handleLookup(body)
+        case "/api/ask":
+          return this.handleAsk(clientId, body)
+        case "/api/reply":
+          return this.handleReply(body)
+        default:
+          return Response.json({ error: "not found" }, { status: 404 })
+      }
+    } catch (err) {
+      console.error(`[relay] request error: ${(err as Error).message}`)
+      return Response.json(
+        { error: `internal error: ${(err as Error).message}` },
+        { status: 500 },
+      )
     }
   }
 
-  private onRegister(
-    ws: WS,
-    msg: Extract<ClientMessage, { type: "register" }>,
+  private touchClient(
+    clientId: string,
+    req: Request,
+    server: Server<undefined>,
   ): void {
+    this.clientLastSeen.set(clientId, Date.now())
+    try {
+      const addr = server.requestIP(req)
+      if (addr) this.clientIps.set(clientId, addr.address)
+    } catch {
+      /* ignore */
+    }
+    if (!this.clientToSessions.has(clientId)) {
+      this.clientToSessions.set(clientId, new Set())
+    }
+    if (!this.clientQueues.has(clientId)) {
+      this.clientQueues.set(clientId, [])
+    }
+  }
+
+  private handlePoll(clientId: string): Response {
+    const queue = this.clientQueues.get(clientId)
+    if (!queue || queue.length === 0) {
+      return Response.json({ messages: [] })
+    }
+    const messages = [...queue]
+    queue.length = 0
+    return Response.json({ messages })
+  }
+
+  private handleRegister(
+    clientId: string,
+    body: Record<string, unknown>,
+  ): Response {
+    const sessionId = body.sessionId as string
     const now = Date.now()
-    const existing = this.sessions.get(msg.sessionId)
+    const existing = this.sessions.get(sessionId)
     const entry: RegistryEntry = {
-      sessionId: msg.sessionId,
-      summary: msg.summary,
-      directory: msg.directory,
-      projectId: msg.projectId,
-      serverUrl: msg.serverUrl,
-      daemonId: msg.daemonId,
-      deviceName: msg.deviceName,
+      sessionId,
+      summary: body.summary as string,
+      directory: body.directory as string,
+      projectId: body.projectId as string,
+      serverUrl: body.serverUrl as string | undefined,
+      daemonId: body.daemonId as string | undefined,
+      deviceName: body.deviceName as string | undefined,
       registeredAt: existing?.registeredAt ?? now,
       updatedAt: now,
     }
-    const oldOwner = this.sessionToWs.get(msg.sessionId)
-    if (oldOwner && oldOwner !== ws) {
-      this.wsToSessions.get(oldOwner)?.delete(msg.sessionId)
+
+    const oldOwner = this.sessionToClient.get(sessionId)
+    if (oldOwner && oldOwner !== clientId) {
+      this.clientToSessions.get(oldOwner)?.delete(sessionId)
     }
-    this.sessions.set(msg.sessionId, entry)
-    this.sessionToWs.set(msg.sessionId, ws)
-    let owned = this.wsToSessions.get(ws)
-    if (!owned) {
-      owned = new Set<string>()
-      this.wsToSessions.set(ws, owned)
-    }
-    owned.add(msg.sessionId)
-    this.send(ws, { type: "registered", sessionId: msg.sessionId, entry })
+
+    this.sessions.set(sessionId, entry)
+    this.sessionToClient.set(sessionId, clientId)
+    const owned = this.clientToSessions.get(clientId) ?? new Set<string>()
+    owned.add(sessionId)
+    this.clientToSessions.set(clientId, owned)
+
+    console.log(
+      `[relay] registered ${sessionId} (client=${clientId.slice(0, 8)})`,
+    )
+    return Response.json({ type: "registered", sessionId, entry })
   }
 
-  private onUnregister(
-    ws: WS,
-    msg: Extract<ClientMessage, { type: "unregister" }>,
-  ): void {
-    const existed = this.sessions.delete(msg.sessionId)
-    this.sessionToWs.delete(msg.sessionId)
-    this.wsToSessions.get(ws)?.delete(msg.sessionId)
-    this.send(ws, {
+  private handleUnregister(
+    clientId: string,
+    body: Record<string, unknown>,
+  ): Response {
+    const sessionId = body.sessionId as string
+    const existed = this.sessions.delete(sessionId)
+    this.sessionToClient.delete(sessionId)
+    this.clientToSessions.get(clientId)?.delete(sessionId)
+    return Response.json({
       type: "unregistered",
-      sessionId: msg.sessionId,
+      sessionId,
       removed: existed,
     })
   }
 
-  private onList(
-    ws: WS,
-    msg: Extract<ClientMessage, { type: "list" }>,
-  ): void {
+  private handleList(body: Record<string, unknown>): Response {
+    const requestId = body.requestId as string
     const cutoff = Date.now() - STALE_ENTRY_TTL_MS
     const entries = [...this.sessions.values()]
       .filter((e) => e.updatedAt >= cutoff)
       .sort((a, b) => b.updatedAt - a.updatedAt)
-    this.send(ws, { type: "sessions", requestId: msg.requestId, entries })
+    return Response.json({ type: "sessions", requestId, entries })
   }
 
-  private onLookup(
-    ws: WS,
-    msg: Extract<ClientMessage, { type: "lookup" }>,
-  ): void {
-    const entry = this.sessions.get(msg.sessionId) ?? null
-    this.send(ws, { type: "looked-up", requestId: msg.requestId, entry })
+  private handleLookup(body: Record<string, unknown>): Response {
+    const requestId = body.requestId as string
+    const sessionId = body.sessionId as string
+    const entry = this.sessions.get(sessionId) ?? null
+    return Response.json({ type: "looked-up", requestId, entry })
   }
 
-  private onAsk(
-    ws: WS,
-    msg: Extract<ClientMessage, { type: "ask" }>,
-  ): void {
-    const targetWs = this.sessionToWs.get(msg.toSessionId)
-    if (!targetWs) {
-      this.send(ws, {
-        type: "error",
-        requestId: msg.requestId,
-        message: `Target session ${msg.toSessionId} not found`,
+  private handleAsk(
+    clientId: string,
+    body: Record<string, unknown>,
+  ): Response {
+    const requestId = body.requestId as string
+    const toSessionId = body.toSessionId as string
+    const question = body.question as string
+    const timeoutMs = body.timeoutMs as number
+
+    const targetClientId = this.sessionToClient.get(toSessionId)
+    if (!targetClientId) {
+      return Response.json({
+        ok: false,
+        error: `Target session ${toSessionId} not found`,
       })
-      return
     }
-    const owned = this.wsToSessions.get(ws)
-    const first = owned?.values().next().value
-    const fromSessionId: string = first ?? "unknown"
-    this.pendingAsks.set(msg.requestId, {
-      caller: ws,
-      targetSessionId: msg.toSessionId,
+
+    const callerSessions = this.clientToSessions.get(clientId)
+    const fromSessionId: string =
+      callerSessions?.values().next().value ?? "unknown"
+
+    this.pendingAsks.set(requestId, {
+      callerClientId: clientId,
+      targetSessionId: toSessionId,
     })
-    this.send(targetWs, {
+
+    this.enqueue(targetClientId, {
       type: "inbound",
-      requestId: msg.requestId,
+      requestId,
       fromSessionId,
-      toSessionId: msg.toSessionId,
-      question: msg.question,
-      timeoutMs: msg.timeoutMs,
+      toSessionId,
+      question,
+      timeoutMs,
     })
+
+    return Response.json({ ok: true })
   }
 
-  private onReply(msg: Extract<ClientMessage, { type: "reply" }>): void {
-    const pending = this.pendingAsks.get(msg.requestId)
-    if (!pending) return
-    this.pendingAsks.delete(msg.requestId)
-    this.send(pending.caller, {
+  private handleReply(body: Record<string, unknown>): Response {
+    const requestId = body.requestId as string
+    const reply = body.reply as string | undefined
+    const error = body.error as string | undefined
+
+    const pending = this.pendingAsks.get(requestId)
+    if (!pending) {
+      return Response.json({ ok: true })
+    }
+
+    this.pendingAsks.delete(requestId)
+    this.enqueue(pending.callerClientId, {
       type: "reply",
-      requestId: msg.requestId,
-      reply: msg.reply,
-      error: msg.error,
+      requestId,
+      reply,
+      error,
     })
+
+    return Response.json({ ok: true })
   }
 
-  private send(ws: WS, msg: ServerMessage): void {
-    try {
-      ws.send(JSON.stringify(msg))
-    } catch (err) {
-      console.error(`[relay] send failed: ${(err as Error).message}`)
+  private enqueue(clientId: string, msg: ServerMessage): void {
+    let queue = this.clientQueues.get(clientId)
+    if (!queue) {
+      queue = []
+      this.clientQueues.set(clientId, queue)
+    }
+    queue.push(msg)
+  }
+
+  private cleanupStaleClients(): void {
+    const cutoff = Date.now() - CLIENT_STALE_MS
+    for (const [clientId, lastSeen] of this.clientLastSeen) {
+      if (lastSeen >= cutoff) continue
+
+      const owned = this.clientToSessions.get(clientId) ?? new Set()
+      for (const sid of owned) {
+        this.sessions.delete(sid)
+        this.sessionToClient.delete(sid)
+      }
+
+      for (const [reqId, pending] of this.pendingAsks) {
+        if (pending.callerClientId === clientId) {
+          this.pendingAsks.delete(reqId)
+        } else if (owned.has(pending.targetSessionId)) {
+          this.enqueue(pending.callerClientId, {
+            type: "reply",
+            requestId: reqId,
+            error: `Target session ${pending.targetSessionId} disconnected`,
+          })
+          this.pendingAsks.delete(reqId)
+        }
+      }
+
+      this.clientToSessions.delete(clientId)
+      this.clientLastSeen.delete(clientId)
+      this.clientIps.delete(clientId)
+      this.clientQueues.delete(clientId)
+
+      console.log(
+        `[relay] cleaned up stale client ${clientId.slice(0, 8)} (${owned.size} sessions)`,
+      )
     }
   }
 }

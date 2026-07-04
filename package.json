@@ -1,7 +1,7 @@
 {
   "name": "opencode-cross-session-messaging",
-  "version": "0.1.0",
-  "description": "OpenCode plugin for cross-session messaging — local file IPC or cross-device relay via WebSocket. Sessions discover, ask, and reply across machines.",
+  "version": "0.2.0",
+  "description": "OpenCode plugin for cross-session messaging — local file IPC or cross-device relay via HTTP polling. Sessions discover, ask, and reply across machines.",
   "type": "module",
   "license": "MIT",
   "repository": {

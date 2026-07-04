@@ -1,187 +1,88 @@
 import { randomUUID } from "node:crypto"
-import { RELAY_RECONNECT_MAX_MS, RELAY_RECONNECT_MS } from "../constants.ts"
-import type { ClientMessage, ServerMessage } from "../relay/protocol.ts"
+import { RELAY_HTTP_POLL_MS } from "../constants.ts"
+import type { ServerMessage } from "../relay/protocol.ts"
 import { AskTimeoutError } from "../types.ts"
 import type { RegistryEntry } from "../types.ts"
 import type { InboxHandler, ITransport } from "./interface.ts"
-
-type ConnState = "disconnected" | "connecting" | "connected"
 
 interface Pending {
   resolve: (msg: ServerMessage) => void
   reject: (err: Error) => void
 }
 
-const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
-
 export class RelayTransport implements ITransport {
-  private ws: WebSocket | null = null
-  private state: ConnState = "disconnected"
-  private connectPromise: Promise<void> | null = null
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
-  private reconnectDelay = RELAY_RECONNECT_MS
+  private readonly clientId = randomUUID()
   private disposed = false
 
   private pending = new Map<string, Pending>()
-  private pendingRegister = new Map<string, Pending>()
-  private pendingUnregister = new Map<string, Pending>()
-
   private registeredEntries = new Map<
     string,
     Omit<RegistryEntry, "registeredAt" | "updatedAt">
   >()
   private inboxHandler: InboxHandler | null = null
 
+  private pollTimer: ReturnType<typeof setInterval> | null = null
+  private polling = false
+
   constructor(private readonly relayUrl: string) {}
 
   async register(
     entry: Omit<RegistryEntry, "registeredAt" | "updatedAt">,
   ): Promise<RegistryEntry> {
-    await this.ensureConnected()
+    this.checkDisposed()
     this.registeredEntries.set(entry.sessionId, entry)
 
-    return new Promise<RegistryEntry>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingRegister.delete(entry.sessionId)
-        reject(new Error(`register(${entry.sessionId}) timed out`))
-      }, DEFAULT_REQUEST_TIMEOUT_MS)
+    const res = (await this.post("/api/register", {
+      clientId: this.clientId,
+      ...entry,
+    })) as ServerMessage
 
-      this.pendingRegister.set(entry.sessionId, {
-        resolve: (msg) => {
-          clearTimeout(timer)
-          if (msg.type === "registered") {
-            resolve(msg.entry)
-          } else if (msg.type === "error") {
-            reject(new Error(msg.message))
-          } else {
-            reject(new Error(`Unexpected response: ${msg.type}`))
-          }
-        },
-        reject: (err) => {
-          clearTimeout(timer)
-          reject(err)
-        },
-      })
-
-      try {
-        this.send({ type: "register", ...entry })
-      } catch (err) {
-        this.pendingRegister.delete(entry.sessionId)
-        clearTimeout(timer)
-        reject(err instanceof Error ? err : new Error(String(err)))
-      }
-    })
+    if (res.type === "registered") return res.entry
+    if (res.type === "error") throw new Error(res.message)
+    throw new Error(`Unexpected response: ${res.type}`)
   }
 
   async list(): Promise<RegistryEntry[]> {
-    await this.ensureConnected()
+    this.checkDisposed()
     const requestId = randomUUID()
 
-    return new Promise<RegistryEntry[]>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(requestId)
-        reject(new Error("list() timed out"))
-      }, DEFAULT_REQUEST_TIMEOUT_MS)
+    const res = (await this.post("/api/list", {
+      clientId: this.clientId,
+      requestId,
+    })) as ServerMessage
 
-      this.pending.set(requestId, {
-        resolve: (msg) => {
-          clearTimeout(timer)
-          if (msg.type === "sessions") {
-            resolve(msg.entries)
-          } else if (msg.type === "error") {
-            reject(new Error(msg.message))
-          } else {
-            reject(new Error(`Unexpected response: ${msg.type}`))
-          }
-        },
-        reject: (err) => {
-          clearTimeout(timer)
-          reject(err)
-        },
-      })
-
-      try {
-        this.send({ type: "list", requestId })
-      } catch (err) {
-        this.pending.delete(requestId)
-        clearTimeout(timer)
-        reject(err instanceof Error ? err : new Error(String(err)))
-      }
-    })
+    if (res.type === "sessions") return res.entries
+    if (res.type === "error") throw new Error(res.message)
+    throw new Error(`Unexpected response: ${res.type}`)
   }
 
   async remove(sessionId: string): Promise<boolean> {
-    await this.ensureConnected()
+    this.checkDisposed()
     this.registeredEntries.delete(sessionId)
 
-    return new Promise<boolean>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingUnregister.delete(sessionId)
-        reject(new Error(`remove(${sessionId}) timed out`))
-      }, DEFAULT_REQUEST_TIMEOUT_MS)
+    const res = (await this.post("/api/unregister", {
+      clientId: this.clientId,
+      sessionId,
+    })) as ServerMessage
 
-      this.pendingUnregister.set(sessionId, {
-        resolve: (msg) => {
-          clearTimeout(timer)
-          if (msg.type === "unregistered") {
-            resolve(msg.removed)
-          } else if (msg.type === "error") {
-            reject(new Error(msg.message))
-          } else {
-            reject(new Error(`Unexpected response: ${msg.type}`))
-          }
-        },
-        reject: (err) => {
-          clearTimeout(timer)
-          reject(err)
-        },
-      })
-
-      try {
-        this.send({ type: "unregister", sessionId })
-      } catch (err) {
-        this.pendingUnregister.delete(sessionId)
-        clearTimeout(timer)
-        reject(err instanceof Error ? err : new Error(String(err)))
-      }
-    })
+    if (res.type === "unregistered") return res.removed
+    if (res.type === "error") throw new Error(res.message)
+    throw new Error(`Unexpected response: ${res.type}`)
   }
 
   async lookup(sessionId: string): Promise<RegistryEntry | null> {
-    await this.ensureConnected()
+    this.checkDisposed()
     const requestId = randomUUID()
 
-    return new Promise<RegistryEntry | null>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(requestId)
-        reject(new Error(`lookup(${sessionId}) timed out`))
-      }, DEFAULT_REQUEST_TIMEOUT_MS)
+    const res = (await this.post("/api/lookup", {
+      clientId: this.clientId,
+      requestId,
+      sessionId,
+    })) as ServerMessage
 
-      this.pending.set(requestId, {
-        resolve: (msg) => {
-          clearTimeout(timer)
-          if (msg.type === "looked-up") {
-            resolve(msg.entry)
-          } else if (msg.type === "error") {
-            reject(new Error(msg.message))
-          } else {
-            reject(new Error(`Unexpected response: ${msg.type}`))
-          }
-        },
-        reject: (err) => {
-          clearTimeout(timer)
-          reject(err)
-        },
-      })
-
-      try {
-        this.send({ type: "lookup", requestId, sessionId })
-      } catch (err) {
-        this.pending.delete(requestId)
-        clearTimeout(timer)
-        reject(err instanceof Error ? err : new Error(String(err)))
-      }
-    })
+    if (res.type === "looked-up") return res.entry
+    if (res.type === "error") throw new Error(res.message)
+    throw new Error(`Unexpected response: ${res.type}`)
   }
 
   async ask(params: {
@@ -191,80 +92,86 @@ export class RelayTransport implements ITransport {
     timeoutMs: number
     abort?: AbortSignal
   }): Promise<{ reply?: string; error?: string }> {
-    await this.ensureConnected()
+    this.checkDisposed()
+    this.ensurePollStarted()
     const { requestId, toSessionId, question, timeoutMs, abort } = params
 
-    return new Promise<{ reply?: string; error?: string }>((resolve, reject) => {
-      let abortListener: (() => void) | null = null
-      const removeAbortListener = () => {
-        if (abortListener && abort) {
-          abort.removeEventListener("abort", abortListener)
-          abortListener = null
-        }
-      }
-
-      const timer = setTimeout(() => {
-        this.pending.delete(requestId)
-        removeAbortListener()
-        reject(new AskTimeoutError(toSessionId, timeoutMs))
-      }, timeoutMs)
-
-      this.pending.set(requestId, {
-        resolve: (msg) => {
-          clearTimeout(timer)
-          removeAbortListener()
-          if (msg.type === "reply") {
-            resolve({ reply: msg.reply, error: msg.error })
-          } else if (msg.type === "error") {
-            reject(new Error(msg.message))
-          } else {
-            reject(new Error(`Unexpected response: ${msg.type}`))
+    return new Promise<{ reply?: string; error?: string }>(
+      (resolve, reject) => {
+        let abortListener: (() => void) | null = null
+        const removeAbortListener = () => {
+          if (abortListener && abort) {
+            abort.removeEventListener("abort", abortListener)
+            abortListener = null
           }
-        },
-        reject: (err) => {
+        }
+
+        const cleanup = () => {
+          this.pending.delete(requestId)
           clearTimeout(timer)
           removeAbortListener()
-          reject(err)
-        },
-      })
-
-      if (abort) {
-        if (abort.aborted) {
-          this.pending.delete(requestId)
-          clearTimeout(timer)
-          reject(new Error("Aborted"))
-          return
         }
-        abortListener = () => {
-          this.pending.delete(requestId)
-          clearTimeout(timer)
-          reject(new Error("Aborted"))
-        }
-        abort.addEventListener("abort", abortListener, { once: true })
-      }
 
-      try {
-        this.send({
-          type: "ask",
+        const timer = setTimeout(() => {
+          cleanup()
+          reject(new AskTimeoutError(toSessionId, timeoutMs))
+        }, timeoutMs)
+
+        this.pending.set(requestId, {
+          resolve: (msg) => {
+            cleanup()
+            if (msg.type === "reply") {
+              resolve({ reply: msg.reply, error: msg.error })
+            } else if (msg.type === "error") {
+              reject(new Error(msg.message))
+            } else {
+              reject(new Error(`Unexpected response: ${msg.type}`))
+            }
+          },
+          reject: (err) => {
+            cleanup()
+            reject(err)
+          },
+        })
+
+        if (abort) {
+          if (abort.aborted) {
+            cleanup()
+            reject(new Error("Aborted"))
+            return
+          }
+          abortListener = () => {
+            cleanup()
+            reject(new Error("Aborted"))
+          }
+          abort.addEventListener("abort", abortListener, { once: true })
+        }
+
+        this.post("/api/ask", {
+          clientId: this.clientId,
           requestId,
           toSessionId,
           question,
           timeoutMs,
         })
-      } catch (err) {
-        this.pending.delete(requestId)
-        clearTimeout(timer)
-        removeAbortListener()
-        reject(err instanceof Error ? err : new Error(String(err)))
-      }
-    })
+          .then((raw) => {
+            const data = raw as { ok: boolean; error?: string }
+            if (!data.ok && data.error) {
+              cleanup()
+              reject(new Error(data.error))
+            }
+          })
+          .catch((err) => {
+            cleanup()
+            reject(err instanceof Error ? err : new Error(String(err)))
+          })
+      },
+    )
   }
 
   startInbox(handler: InboxHandler): void {
     this.inboxHandler = handler
-    this.ensureConnected().catch(() => {
-      /* reconnect loop retries */
-    })
+    this.ensurePollStarted()
   }
 
   async stopInbox(): Promise<void> {
@@ -273,188 +180,75 @@ export class RelayTransport implements ITransport {
 
   async dispose(): Promise<void> {
     this.disposed = true
-
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
-      this.reconnectTimer = null
-    }
+    this.stopPoll()
 
     const err = new Error("Transport disposed")
     for (const p of this.pending.values()) p.reject(err)
     this.pending.clear()
-    for (const p of this.pendingRegister.values()) p.reject(err)
-    this.pendingRegister.clear()
-    for (const p of this.pendingUnregister.values()) p.reject(err)
-    this.pendingUnregister.clear()
 
     this.inboxHandler = null
     this.registeredEntries.clear()
-
-    if (this.ws) {
-      try {
-        this.ws.close()
-      } catch {
-        /* ignore */
-      }
-      this.ws = null
-    }
-    this.state = "disconnected"
-    this.connectPromise = null
   }
 
-  private ensureConnected(): Promise<void> {
-    if (this.disposed) return Promise.reject(new Error("Transport disposed"))
-    if (this.state === "connected") return Promise.resolve()
-    if (this.connectPromise) return this.connectPromise
-    this.connectPromise = this.doConnect()
-    return this.connectPromise
+  private checkDisposed(): void {
+    if (this.disposed) throw new Error("Transport disposed")
   }
 
-  private doConnect(): Promise<void> {
-    this.state = "connecting"
-    return new Promise<void>((resolve, reject) => {
-      let ws: WebSocket
-      try {
-        ws = new WebSocket(this.relayUrl)
-      } catch (err) {
-        this.state = "disconnected"
-        this.connectPromise = null
-        this.scheduleReconnect()
-        reject(err instanceof Error ? err : new Error(String(err)))
-        return
-      }
-      this.ws = ws
-
-      let settled = false
-
-      const onOpen = () => {
-        settled = true
-        this.state = "connected"
-        this.reconnectDelay = RELAY_RECONNECT_MS
-        for (const entry of this.registeredEntries.values()) {
-          try {
-            ws.send(JSON.stringify({ type: "register", ...entry }))
-          } catch {
-            /* ignore - onClose will handle */
-          }
-        }
-        resolve()
-      }
-
-      const onError = () => {
-        if (!settled) {
-          settled = true
-          reject(new Error(`Failed to connect to relay at ${this.relayUrl}`))
-        }
-      }
-
-      const onClose = () => {
-        this.state = "disconnected"
-        this.ws = null
-        this.connectPromise = null
-
-        const err = new Error("WebSocket disconnected")
-        for (const p of this.pending.values()) p.reject(err)
-        this.pending.clear()
-        for (const p of this.pendingRegister.values()) p.reject(err)
-        this.pendingRegister.clear()
-        for (const p of this.pendingUnregister.values()) p.reject(err)
-        this.pendingUnregister.clear()
-
-        if (!settled) {
-          settled = true
-          reject(err)
-        }
-
-        if (!this.disposed) {
-          this.scheduleReconnect()
-        }
-      }
-
-      const onMessage = (event: MessageEvent) => {
-        this.handleMessage(event.data)
-      }
-
-      ws.addEventListener("open", onOpen)
-      ws.addEventListener("error", onError)
-      ws.addEventListener("close", onClose)
-      ws.addEventListener("message", onMessage)
-    })
-  }
-
-  private scheduleReconnect(): void {
-    if (this.disposed || this.reconnectTimer) return
-    if (this.registeredEntries.size === 0 && !this.inboxHandler) return
-
-    const delay = this.reconnectDelay
-    this.reconnectDelay = Math.min(
-      this.reconnectDelay * 2,
-      RELAY_RECONNECT_MAX_MS,
+  private ensurePollStarted(): void {
+    if (this.pollTimer || this.disposed) return
+    void this.doPoll()
+    this.pollTimer = setInterval(
+      () => void this.doPoll(),
+      RELAY_HTTP_POLL_MS,
     )
-
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null
-      if (this.disposed) return
-      this.ensureConnected().catch(() => {
-        /* scheduleReconnect fires again from onClose */
-      })
-    }, delay)
   }
 
-  private send(msg: ClientMessage): void {
-    if (!this.ws || this.state !== "connected") {
-      throw new Error("WebSocket not connected")
+  private stopPoll(): void {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer)
+      this.pollTimer = null
     }
-    this.ws.send(JSON.stringify(msg))
   }
 
-  private trySend(msg: ClientMessage): void {
-    if (!this.ws || this.state !== "connected") return
+  private async doPoll(): Promise<void> {
+    if (this.polling || this.disposed) return
+    this.polling = true
     try {
-      this.ws.send(JSON.stringify(msg))
+      const res = await fetch(
+        `${this.relayUrl}/api/poll?clientId=${encodeURIComponent(this.clientId)}`,
+      )
+      if (!res.ok) return
+      const data = (await res.json()) as { messages?: ServerMessage[] }
+      if (data.messages) {
+        for (const msg of data.messages) {
+          this.handleMessage(msg)
+        }
+      }
     } catch {
-      /* ignore */
+      // server unreachable — retry on next tick
+    } finally {
+      this.polling = false
     }
   }
 
-  private handleMessage(data: unknown): void {
-    let text: string
-    if (typeof data === "string") {
-      text = data
-    } else if (data instanceof ArrayBuffer) {
-      text = new TextDecoder().decode(data)
-    } else if (data instanceof Uint8Array) {
-      text = new TextDecoder().decode(data)
-    } else {
-      return
+  private async post(
+    path: string,
+    body: Record<string, unknown>,
+  ): Promise<unknown> {
+    const res = await fetch(`${this.relayUrl}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(`HTTP ${res.status}: ${text}`)
     }
+    return res.json()
+  }
 
-    let msg: ServerMessage
-    try {
-      msg = JSON.parse(text) as ServerMessage
-    } catch {
-      return
-    }
-
+  private handleMessage(msg: ServerMessage): void {
     switch (msg.type) {
-      case "registered": {
-        const p = this.pendingRegister.get(msg.sessionId)
-        if (p) {
-          this.pendingRegister.delete(msg.sessionId)
-          p.resolve(msg)
-        }
-        return
-      }
-      case "unregistered": {
-        const p = this.pendingUnregister.get(msg.sessionId)
-        if (p) {
-          this.pendingUnregister.delete(msg.sessionId)
-          p.resolve(msg)
-        }
-        return
-      }
-      case "sessions":
-      case "looked-up":
       case "reply": {
         const p = this.pending.get(msg.requestId)
         if (p) {
@@ -485,8 +279,8 @@ export class RelayTransport implements ITransport {
   ): Promise<void> {
     const handler = this.inboxHandler
     if (!handler) {
-      this.trySend({
-        type: "reply",
+      await this.tryPost("/api/reply", {
+        clientId: this.clientId,
         requestId: msg.requestId,
         error: "No inbox handler registered",
       })
@@ -496,10 +290,29 @@ export class RelayTransport implements ITransport {
       const reply = await handler(msg.toSessionId, msg.question, {
         timeoutMs: msg.timeoutMs,
       })
-      this.trySend({ type: "reply", requestId: msg.requestId, reply })
+      await this.tryPost("/api/reply", {
+        clientId: this.clientId,
+        requestId: msg.requestId,
+        reply,
+      })
     } catch (err) {
       const errmsg = err instanceof Error ? err.message : String(err)
-      this.trySend({ type: "reply", requestId: msg.requestId, error: errmsg })
+      await this.tryPost("/api/reply", {
+        clientId: this.clientId,
+        requestId: msg.requestId,
+        error: errmsg,
+      })
+    }
+  }
+
+  private async tryPost(
+    path: string,
+    body: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await this.post(path, body)
+    } catch {
+      /* ignore */
     }
   }
 }
