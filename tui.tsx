@@ -286,10 +286,10 @@ function PeersPanel(props: {
           count += EXPANDED_EXTRA
       }
     }
-    let top = scrollTop()
-    if (selLine < top) top = selLine
-    if (selLine >= top + VIEWPORT_ROWS) top = selLine - VIEWPORT_ROWS + 1
+    const half = Math.floor(VIEWPORT_ROWS / 2)
+    let top = selLine - half
     if (top < 0) top = 0
+    if (top + VIEWPORT_ROWS > all.length) top = Math.max(0, all.length - VIEWPORT_ROWS)
     setScrollTop(top)
     return all.slice(top, top + VIEWPORT_ROWS)
   }
