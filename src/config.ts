@@ -33,12 +33,17 @@ async function writeConfig(config: RelayConfig): Promise<void> {
   await fs.writeFile(path, JSON.stringify(config, null, 2), "utf8")
 }
 
+function normalizeRelayUrl(url: string): string {
+  return url.replace(/^ws(s?):\/\//, "http$1://")
+}
+
 export function getRelayUrl(
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
   const envUrl = env.CROSS_SESSION_RELAY_URL?.trim()
-  if (envUrl && envUrl.length > 0) return envUrl
-  return readConfig().current
+  if (envUrl && envUrl.length > 0) return normalizeRelayUrl(envUrl)
+  const stored = readConfig().current
+  return stored ? normalizeRelayUrl(stored) : null
 }
 
 export function getRelayHistory(): string[] {
