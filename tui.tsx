@@ -10,11 +10,9 @@ import { listEntries, removeEntry, upsertEntry } from "./src/registry.ts"
 import type { RegistryEntry } from "./src/types.ts"
 import type { RelayServer } from "./src/relay/server.ts"
 import {
-  addSuppressedSession,
   clearRelayUrl,
   getRelayHistory,
   getRelayUrl,
-  readSuppressedSessions,
   writeRelayUrl,
 } from "./src/config.ts"
 
@@ -164,7 +162,6 @@ interface VLine {
 }
 
 async function deleteSession(sessionId: string): Promise<void> {
-  addSuppressedSession(sessionId)
   const relayUrl = getRelayUrl()
   if (relayUrl) {
     const res = await fetch(`${relayUrl}/api/unregister`, {
@@ -619,10 +616,6 @@ const plugin: TuiPluginModule = {
               entries = data.entries ?? []
             } else {
               entries = await listEntries()
-            }
-            const suppressed = readSuppressedSessions()
-            if (suppressed.size > 0) {
-              entries = entries.filter((e) => !suppressed.has(e.sessionId))
             }
             if (entries.length === 0) {
               api.ui.toast({

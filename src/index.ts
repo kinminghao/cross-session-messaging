@@ -3,12 +3,7 @@ import { tool } from "@opencode-ai/plugin/tool"
 import { randomUUID } from "node:crypto"
 import { hostname } from "node:os"
 import { askAndWaitForReply, type AskClient } from "./askAndWaitForReply.ts"
-import {
-  clearSuppressedSessions,
-  getRelayUrl,
-  readSuppressedSessions,
-  writeRelayUrl,
-} from "./config.ts"
+import { getRelayUrl, writeRelayUrl } from "./config.ts"
 import { PLUGIN_ID, SESSION_DISCOVERY_MS } from "./constants.ts"
 import { createEventHandler } from "./eventHooks.ts"
 import { initLogger, log } from "./logger.ts"
@@ -57,8 +52,6 @@ const plugin: PluginModule = {
       askAndWaitForReply(client, sessionId, question, opts),
     )
 
-    clearSuppressedSessions()
-
     interface DiscoveredSession {
       id: string
       title: string
@@ -66,7 +59,7 @@ const plugin: PluginModule = {
       directory: string
     }
 
-    const knownSessionIds = new Set<string>()
+    const processedIds = new Set<string>()
     const discoveryPoller = setInterval(async () => {
       try {
         const sessions = (await input.client.session.list({
@@ -74,11 +67,11 @@ const plugin: PluginModule = {
           responseStyle: "data",
         })) as unknown as DiscoveredSession[]
 
-        const suppressed = readSuppressedSessions()
         const currentIds = new Set<string>()
         for (const s of sessions) {
           currentIds.add(s.id)
-          if (suppressed.has(s.id)) continue
+          if (processedIds.has(s.id)) continue
+          processedIds.add(s.id)
           try {
             await transport.register({
               sessionId: s.id,
@@ -94,8 +87,9 @@ const plugin: PluginModule = {
           }
         }
 
-        for (const id of knownSessionIds) {
+        for (const id of processedIds) {
           if (!currentIds.has(id)) {
+            processedIds.delete(id)
             try {
               await transport.remove(id)
             } catch {
@@ -103,9 +97,6 @@ const plugin: PluginModule = {
             }
           }
         }
-
-        knownSessionIds.clear()
-        for (const id of currentIds) knownSessionIds.add(id)
       } catch (err) {
         log.warn("discovery:fail", {
           error: err instanceof Error ? err.message : String(err),
