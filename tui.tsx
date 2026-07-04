@@ -187,28 +187,18 @@ function SessionRow(props: {
       </box>
       <Show when={props.expanded}>
         <box flexDirection="column" paddingLeft={4}>
-          <box flexDirection="row" gap={1}>
-            <text fg={theme().textMuted}>ID:</text>
-            <text fg={theme().text}>{e.sessionId}</text>
-          </box>
-          <box flexDirection="row" gap={1}>
-            <text fg={theme().textMuted}>Summary:</text>
-            <text fg={theme().text}>{e.summary}</text>
-          </box>
-          <box flexDirection="row" gap={1}>
-            <text fg={theme().textMuted}>Dir:</text>
-            <text fg={theme().text}>{e.directory}</text>
-          </box>
-          <box flexDirection="row" gap={1}>
-            <text fg={theme().textMuted}>Project:</text>
-            <text fg={theme().text}>{e.projectId}</text>
-          </box>
-          <Show when={e.deviceName}>
-            <box flexDirection="row" gap={1}>
-              <text fg={theme().textMuted}>Device:</text>
-              <text fg={theme().text}>{e.deviceName}</text>
-            </box>
-          </Show>
+          <text fg={theme().textMuted}>
+            {`ID:  ${e.sessionId}`}
+          </text>
+          <text fg={theme().text}>
+            {`Sum: ${truncate(e.summary, 60)}`}
+          </text>
+          <text fg={theme().textMuted}>
+            {`Dir: ${truncate(e.directory, 60)}`}
+          </text>
+          <text fg={theme().textMuted}>
+            {`Prj: ${truncate(e.projectId, 40)}`}
+          </text>
         </box>
       </Show>
     </box>
