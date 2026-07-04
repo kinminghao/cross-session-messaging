@@ -1,7 +1,7 @@
 {
   "name": "opencode-cross-session-messaging",
-  "version": "0.0.2",
-  "description": "OpenCode plugin that lets sessions send messages to each other and wait for AI-generated replies (peer-to-peer, cross-project). See cross-session-messaging-design.md.",
+  "version": "0.1.0",
+  "description": "OpenCode plugin for cross-session messaging — local file IPC or cross-device relay via WebSocket. Sessions discover, ask, and reply across machines.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -13,6 +13,8 @@
     "opencode-plugin",
     "multi-agent",
     "cross-session",
+    "cross-device",
+    "relay",
     "messaging"
   ],
   "main": "src/index.ts",
