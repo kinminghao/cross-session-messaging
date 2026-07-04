@@ -670,6 +670,22 @@ const plugin: TuiPluginModule = {
                   return
                 }
                 try {
+                  const relayUrl = getRelayUrl()
+                  if (relayUrl) {
+                    const res = await fetch(`${relayUrl}/api/register`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        clientId: `tui-reg-${randomUUID().slice(0, 8)}`,
+                        sessionId: sessionID,
+                        summary: trimmed,
+                        directory: api.state.path.directory,
+                        projectId: api.state.path.worktree,
+                        deviceName: hostname(),
+                      }),
+                    })
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+                  }
                   await upsertEntry({
                     sessionId: sessionID,
                     summary: trimmed,
