@@ -52,3 +52,6 @@ export const RELAY_RECONNECT_MAX_MS = 30_000
 
 /** HTTP polling interval for relay transport (max 1 request per second). */
 export const RELAY_HTTP_POLL_MS = 1_000
+
+/** How often to auto-discover and register local sessions with the transport. */
+export const SESSION_DISCOVERY_MS = 10_000
