@@ -152,44 +152,12 @@ function shortDir(dir: string): string {
   return parts.length <= 3 ? dir : `…/${parts.slice(-2).join("/")}`
 }
 
-function SessionRow(props: {
-  api: TuiPluginApi
-  entry: RegistryEntry
-  selected: boolean
-  expanded: boolean
-  isSelf: boolean
-  isRemote: boolean
-  confirming?: boolean
-}) {
-  const theme = () => props.api.theme.current
-  const e = props.entry
-  const compactLine = () => {
-    const arrow = props.selected ? (props.expanded ? "▼" : "▶") : " "
-    const title = truncate(e.summary || e.sessionId, 36)
-    const self = props.isSelf ? " ★" : ""
-    const dir = shortDir(e.directory)
-    const age = formatAge(Date.now() - e.updatedAt)
-    const del = props.confirming ? " ⚠ delete?" : ""
-    return `${arrow} ${title}${self}  ${dir}  ${age}${del}`
-  }
-  return (
-    <box flexDirection="column">
-      <text fg={props.selected ? theme().primary : theme().text}>
-        {compactLine()}
-      </text>
-      <Show when={props.expanded}>
-        <text fg={theme().textMuted}>
-          {`    ID:  ${e.sessionId}`}
-        </text>
-        <text fg={theme().textMuted}>
-          {`    Dir: ${truncate(e.directory, 60)}`}
-        </text>
-        <text fg={theme().textMuted}>
-          {`    Prj: ${truncate(e.projectId, 40)}`}
-        </text>
-      </Show>
-    </box>
-  )
+const VIEWPORT_ROWS = 40
+const EXPANDED_EXTRA = 7
+
+interface VLine {
+  text: string
+  style: "selected" | "normal" | "muted"
 }
 
 async function deleteSession(sessionId: string): Promise<void> {
@@ -219,6 +187,7 @@ function PeersPanel(props: {
   const [entries, setEntries] = createSignal(props.entries)
   const [tabIndex, setTabIndex] = createSignal(0)
   const [rowIndex, setRowIndex] = createSignal(0)
+  const [scrollTop, setScrollTop] = createSignal(0)
   const [expandedIds, setExpandedIds] = createSignal<Set<string>>(new Set())
   const [confirmingDelete, setConfirmingDelete] = createSignal<string | null>(
     null,
@@ -227,8 +196,7 @@ function PeersPanel(props: {
   function toggleExpand(sessionId: string, force?: boolean): void {
     setExpandedIds((prev) => {
       const next = new Set(prev)
-      const shouldExpand = force ?? !next.has(sessionId)
-      if (shouldExpand) next.add(sessionId)
+      if (force ?? !next.has(sessionId)) next.add(sessionId)
       else next.delete(sessionId)
       return next
     })
@@ -253,8 +221,11 @@ function PeersPanel(props: {
   function switchTab(delta: number): void {
     const devs = devices()
     if (devs.length === 0) return
-    setTabIndex((i) => ((i + delta) % devs.length + devs.length) % devs.length)
+    setTabIndex(
+      (i) => (((i + delta) % devs.length) + devs.length) % devs.length,
+    )
     setRowIndex(0)
+    setScrollTop(0)
     setConfirmingDelete(null)
   }
 
@@ -263,6 +234,75 @@ function PeersPanel(props: {
     if (!tab) return
     setConfirmingDelete(null)
     setRowIndex((i) => Math.max(0, Math.min(tab.items.length - 1, i + delta)))
+  }
+
+  function buildLines(): VLine[] {
+    const tab = currentTab()
+    if (!tab) return []
+    const lines: VLine[] = []
+    for (let i = 0; i < tab.items.length; i++) {
+      const e = tab.items[i]
+      const sel = i === rowIndex()
+      const exp = expandedIds().has(e.sessionId)
+      const arrow = sel ? (exp ? "▼" : "▶") : " "
+      const title = truncate(e.summary || e.sessionId, 36)
+      const self = e.sessionId === props.selfId ? " ★" : ""
+      const dir = shortDir(e.directory)
+      const age = formatAge(Date.now() - e.updatedAt)
+      const del = confirmingDelete() === e.sessionId ? " ⚠ delete?" : ""
+      lines.push({
+        text: `${arrow} ${title}${self}  ${dir}  ${age}${del}`,
+        style: sel ? "selected" : "normal",
+      })
+      if (exp) {
+        const details: string[] = [
+          `    ID:  ${e.sessionId}`,
+          `    Sum: ${truncate(e.summary, 70)}`,
+          `    Dir: ${truncate(e.directory, 70)}`,
+          `    Prj: ${truncate(e.projectId, 50)}`,
+          `    Dev: ${e.deviceName ?? "unknown"}`,
+          `    Srv: ${truncate(e.serverUrl ?? "", 50)}`,
+          "",
+        ]
+        for (const d of details) lines.push({ text: d, style: "muted" })
+      }
+    }
+    return lines
+  }
+
+  function visibleLines(): VLine[] {
+    const all = buildLines()
+    let selLine = 0
+    let count = 0
+    const tab = currentTab()
+    if (tab) {
+      for (let i = 0; i < tab.items.length; i++) {
+        if (i === rowIndex()) {
+          selLine = count
+          break
+        }
+        count++
+        if (expandedIds().has(tab.items[i].sessionId))
+          count += EXPANDED_EXTRA
+      }
+    }
+    let top = scrollTop()
+    if (selLine < top) top = selLine
+    if (selLine >= top + VIEWPORT_ROWS) top = selLine - VIEWPORT_ROWS + 1
+    if (top < 0) top = 0
+    setScrollTop(top)
+    return all.slice(top, top + VIEWPORT_ROWS)
+  }
+
+  function tabLine(): string {
+    return devices()
+      .map((dev, i) => {
+        const active = i === tabIndex()
+        const local = dev.name === localDevice
+        const label = local ? `${dev.name} (local)` : dev.name
+        return `${active ? "▸ " : "  "}${label} (${dev.items.length})`
+      })
+      .join("   ")
   }
 
   useKeyboard((evt) => {
@@ -293,16 +333,14 @@ function PeersPanel(props: {
     if (evt.name === "right" || evt.name === "l") {
       evt.preventDefault()
       evt.stopPropagation()
-      const tab = currentTab()
-      const entry = tab?.items[rowIndex()]
+      const entry = currentTab()?.items[rowIndex()]
       if (entry) toggleExpand(entry.sessionId, true)
       return
     }
     if (evt.name === "left" || evt.name === "h") {
       evt.preventDefault()
       evt.stopPropagation()
-      const tab = currentTab()
-      const entry = tab?.items[rowIndex()]
+      const entry = currentTab()?.items[rowIndex()]
       if (entry) toggleExpand(entry.sessionId, false)
       return
     }
@@ -310,19 +348,12 @@ function PeersPanel(props: {
       evt.preventDefault()
       evt.stopPropagation()
       setConfirmingDelete(null)
-      const tab = currentTab()
-      const entry = tab?.items[rowIndex()]
+      const entry = currentTab()?.items[rowIndex()]
       if (!entry) return
-      const text = formatSessionInfo(entry)
-      if (copyToClipboard(text)) {
+      if (copyToClipboard(formatSessionInfo(entry))) {
         api.ui.toast({
           variant: "success",
           message: `Copied session info for ${entry.sessionId}`,
-        })
-      } else {
-        api.ui.toast({
-          variant: "error",
-          message: "Failed to copy to clipboard.",
         })
       }
       return
@@ -330,8 +361,7 @@ function PeersPanel(props: {
     if (evt.name === "backspace" || evt.name === "delete") {
       evt.preventDefault()
       evt.stopPropagation()
-      const tab = currentTab()
-      const entry = tab?.items[rowIndex()]
+      const entry = currentTab()?.items[rowIndex()]
       if (!entry) return
       if (confirmingDelete() === entry.sessionId) {
         void (async () => {
@@ -344,32 +374,30 @@ function PeersPanel(props: {
             setConfirmingDelete(null)
             if (updated.length === 0) {
               api.ui.dialog.clear()
-              api.ui.toast({
-                variant: "info",
-                message: "No sessions remaining.",
-              })
+              api.ui.toast({ variant: "info", message: "No sessions." })
               return
             }
-            const newTab = (() => {
-              const devs = [...new Map(
-                updated.map((e) => [e.deviceName ?? "unknown", true]),
-              ).keys()]
-              if (tabIndex() >= devs.length) setTabIndex(devs.length - 1)
-              return devs[tabIndex()]
-            })()
+            const devNames = [
+              ...new Set(updated.map((e) => e.deviceName ?? "unknown")),
+            ]
+            if (tabIndex() >= devNames.length)
+              setTabIndex(devNames.length - 1)
             const tabItems = updated.filter(
-              (e) => (e.deviceName ?? "unknown") === newTab,
+              (e) =>
+                (e.deviceName ?? "unknown") === devNames[tabIndex()],
             )
-            setRowIndex((i) => Math.min(i, Math.max(0, tabItems.length - 1)))
+            setRowIndex((i) =>
+              Math.min(i, Math.max(0, tabItems.length - 1)),
+            )
             api.ui.toast({
               variant: "success",
-              message: `Removed session ${entry.sessionId}`,
+              message: `Removed ${entry.sessionId}`,
             })
           } catch (error) {
             setConfirmingDelete(null)
             api.ui.toast({
               variant: "error",
-              message: `Failed to remove: ${error instanceof Error ? error.message : String(error)}`,
+              message: `Failed: ${error instanceof Error ? error.message : String(error)}`,
             })
           }
         })()
@@ -381,58 +409,27 @@ function PeersPanel(props: {
   })
 
   return (
-    <box
-      paddingTop={1}
-      paddingBottom={1}
-      paddingLeft={2}
-      paddingRight={2}
-      gap={1}
-      flexDirection="column"
-    >
-      <box flexDirection="row" justifyContent="space-between">
-        <text fg={theme().text}>
-          <b>Peer Sessions ({entries().length})</b>
-        </text>
-        <text fg={theme().textMuted}>
-          tab switch · ↑↓ navigate · ←→ fold · ⏎ copy · ⌫ del · esc
-        </text>
-      </box>
-
-      <box flexDirection="row" gap={2}>
-        <For each={devices()}>
-          {(dev, di) => {
-            const isActive = () => di() === tabIndex()
-            const isLocal = dev.name === localDevice
-            return (
-              <text
-                fg={isActive() ? theme().primary : theme().textMuted}
-              >
-                {isActive() ? "▸ " : "  "}
-                {isLocal ? `${dev.name} (local)` : dev.name}
-                {` (${dev.items.length})`}
-              </text>
-            )
-          }}
-        </For>
-      </box>
-
-      <box flexDirection="column" overflow="scroll" maxHeight={20}>
-        <For each={currentTab()?.items ?? []}>
-          {(entry, ri) => (
-            <SessionRow
-              api={api}
-              entry={entry}
-              selected={ri() === rowIndex()}
-              expanded={expandedIds().has(entry.sessionId)}
-              isSelf={entry.sessionId === props.selfId}
-              isRemote={
-                !!entry.deviceName && entry.deviceName !== localDevice
-              }
-              confirming={confirmingDelete() === entry.sessionId}
-            />
-          )}
-        </For>
-      </box>
+    <box flexDirection="column" paddingTop={1} paddingLeft={2} paddingRight={2}>
+      <text fg={theme().text}>
+        {`Peer Sessions (${entries().length})  tab·↑↓·←→·⏎·⌫·esc`}
+      </text>
+      <text fg={theme().textMuted}>{tabLine()}</text>
+      <text fg={theme().text}>{""}</text>
+      <For each={visibleLines()}>
+        {(line) => (
+          <text
+            fg={
+              line.style === "selected"
+                ? theme().primary
+                : line.style === "muted"
+                  ? theme().textMuted
+                  : theme().text
+            }
+          >
+            {line.text || " "}
+          </text>
+        )}
+      </For>
     </box>
   )
 }
