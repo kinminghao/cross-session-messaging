@@ -1,19 +1,16 @@
 import { tool } from "@opencode-ai/plugin/tool"
-import { randomUUID } from "node:crypto"
 import {
   DEFAULT_ASK_TIMEOUT_MS,
   MAX_ASK_TIMEOUT_MS,
 } from "../constants.ts"
-import {
-  cleanupRequest,
-  pollForResponse,
-  writeRequest,
-} from "../fileTransport.ts"
 import { log } from "../logger.ts"
-import { readRegistry } from "../registry.ts"
+import type { ITransport } from "../transport/interface.ts"
 import { AskTimeoutError } from "../types.ts"
+import { randomUUID } from "node:crypto"
 
-export function createAskSessionTool(): ReturnType<typeof tool> {
+export function createAskSessionTool(
+  transport: ITransport,
+): ReturnType<typeof tool> {
   return tool({
     description: [
       "Send a self-contained question to ANOTHER opencode session and wait for its AI-generated reply.",
@@ -60,8 +57,7 @@ export function createAskSessionTool(): ReturnType<typeof tool> {
       )
 
       try {
-        const reg = await readRegistry()
-        const entry = reg.sessions[args.sessionId]
+        const entry = await transport.lookup(args.sessionId)
         if (!entry) {
           return {
             title: "not in registry",
@@ -91,13 +87,10 @@ export function createAskSessionTool(): ReturnType<typeof tool> {
 
       const requestId = randomUUID()
       try {
-        await writeRequest({
+        const res = await transport.ask({
           requestId,
           toSessionId: args.sessionId,
           question: args.question,
-          createdAt: Date.now(),
-        })
-        const res = await pollForResponse(requestId, args.sessionId, {
           timeoutMs: budget,
           abort: ctx.abort,
         })
@@ -147,8 +140,6 @@ export function createAskSessionTool(): ReturnType<typeof tool> {
           title: "unexpected error",
           output: `ask_session error: unexpected error contacting session ${args.sessionId}: ${errMsg}`,
         }
-      } finally {
-        await cleanupRequest(requestId)
       }
     },
   })

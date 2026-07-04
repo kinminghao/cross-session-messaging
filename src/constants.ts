@@ -45,3 +45,7 @@ export const MESSAGES_DIR_NAME = "messages"
 export const RESPONSE_POLL_MS = 500
 export const INBOX_POLL_MS = 1_000
 export const INBOX_REQUEST_TIMEOUT_MS = 5 * 60_000
+
+export const RELAY_DEFAULT_PORT = 7351
+export const RELAY_RECONNECT_MS = 3_000
+export const RELAY_RECONNECT_MAX_MS = 30_000

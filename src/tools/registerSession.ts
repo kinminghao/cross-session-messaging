@@ -1,12 +1,16 @@
 import { tool } from "@opencode-ai/plugin/tool"
-import { upsertEntry } from "../registry.ts"
 import { log } from "../logger.ts"
+import type { ITransport } from "../transport/interface.ts"
 
-export function createRegisterSessionTool(input: {
-  projectId: string
-  serverUrl: string
-  daemonId: string
-}): ReturnType<typeof tool> {
+export function createRegisterSessionTool(
+  transport: ITransport,
+  input: {
+    projectId: string
+    serverUrl: string
+    daemonId: string
+    deviceName: string
+  },
+): ReturnType<typeof tool> {
   return tool({
     description: [
       "Advertise THIS session's current task in the shared cross-session registry",
@@ -33,13 +37,14 @@ export function createRegisterSessionTool(input: {
         }
       }
       try {
-        const entry = await upsertEntry({
+        const entry = await transport.register({
           sessionId: ctx.sessionID,
           summary,
           directory: ctx.directory,
           projectId: input.projectId,
           serverUrl: input.serverUrl,
           daemonId: input.daemonId,
+          deviceName: input.deviceName,
         })
         log.info("register_session:ok", {
           sessionId: ctx.sessionID,

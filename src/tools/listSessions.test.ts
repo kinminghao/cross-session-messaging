@@ -5,6 +5,15 @@ import { join } from "node:path"
 import { upsertEntry, writeRegistry } from "../registry.ts"
 import { REGISTRY_SCHEMA_VERSION, type RegistryEntry } from "../types.ts"
 import { createListSessionsTool } from "./listSessions.ts"
+import { FileTransport } from "../transport/file.ts"
+import type { AskClient } from "../askAndWaitForReply.ts"
+
+const fakeClient: AskClient = {
+  session: {
+    async promptAsync() {},
+    async messages() { return [] },
+  },
+}
 
 function makeFakeCtx(overrides: {
   sessionID?: string
@@ -46,11 +55,13 @@ async function seedEntry(
 
 let stateDir: string
 let originalXDG: string | undefined
+let transport: FileTransport
 
 beforeEach(() => {
   originalXDG = process.env.XDG_STATE_HOME
   stateDir = mkdtempSync(join(tmpdir(), "xsm-list-test-"))
   process.env.XDG_STATE_HOME = stateDir
+  transport = new FileTransport(fakeClient, "test-daemon")
 })
 
 afterEach(() => {
@@ -63,7 +74,7 @@ afterEach(() => {
 
 describe("list_sessions tool", () => {
   test("empty registry returns exact 'No sessions registered.' message", async () => {
-    const t = createListSessionsTool()
+    const t = createListSessionsTool(transport, "test-host")
     const result = await t.execute({}, makeFakeCtx())
     const { output } = asStructured(result)
     expect(output).toBe("No sessions registered.")
@@ -73,7 +84,7 @@ describe("list_sessions tool", () => {
     await seedEntry("ses_a", "task A")
     await seedEntry("ses_b", "task B — this is caller")
     await seedEntry("ses_c", "task C")
-    const t = createListSessionsTool()
+    const t = createListSessionsTool(transport, "test-host")
     const result = await t.execute({}, makeFakeCtx({ sessionID: "ses_b" }))
     const { output } = asStructured(result)
     expect(output).toContain("ses_a")
@@ -84,7 +95,7 @@ describe("list_sessions tool", () => {
   test("includeSelf: true includes the calling session", async () => {
     await seedEntry("ses_a", "task A")
     await seedEntry("ses_b", "caller task")
-    const t = createListSessionsTool()
+    const t = createListSessionsTool(transport, "test-host")
     const result = await t.execute(
       { includeSelf: true },
       makeFakeCtx({ sessionID: "ses_b" }),
@@ -116,7 +127,7 @@ describe("list_sessions tool", () => {
       version: REGISTRY_SCHEMA_VERSION,
       sessions: { ses_stale: stale, ses_fresh: fresh },
     })
-    const t = createListSessionsTool()
+    const t = createListSessionsTool(transport, "test-host")
     const result = await t.execute(
       {},
       makeFakeCtx({ sessionID: "ses_caller" }),
@@ -133,7 +144,7 @@ describe("list_sessions tool", () => {
       "/tmp/repo_x",
       "project_zulu",
     )
-    const t = createListSessionsTool()
+    const t = createListSessionsTool(transport, "test-host")
     const result = await t.execute(
       {},
       makeFakeCtx({ sessionID: "ses_caller" }),
@@ -151,7 +162,7 @@ describe("list_sessions tool", () => {
     await seedEntry("ses_middle", "middle")
     await new Promise((r) => setTimeout(r, 10))
     await seedEntry("ses_last", "last added, most recent")
-    const t = createListSessionsTool()
+    const t = createListSessionsTool(transport, "test-host")
     const result = await t.execute(
       {},
       makeFakeCtx({ sessionID: "ses_caller" }),

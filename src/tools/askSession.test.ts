@@ -5,6 +5,15 @@ import { join } from "node:path"
 import { upsertEntry } from "../registry.ts"
 import { writeResponse, getMessagesDir } from "../fileTransport.ts"
 import { createAskSessionTool } from "./askSession.ts"
+import { FileTransport } from "../transport/file.ts"
+import type { AskClient } from "../askAndWaitForReply.ts"
+
+const fakeClient: AskClient = {
+  session: {
+    async promptAsync() {},
+    async messages() { return [] },
+  },
+}
 
 function makeFakeCtx(
   overrides: { sessionID?: string; abort?: AbortSignal } = {},
@@ -31,11 +40,13 @@ function asStructured(result: unknown): { title: string; output: string } {
 
 let stateDir: string
 let originalXDG: string | undefined
+let transport: FileTransport
 
 beforeEach(() => {
   originalXDG = process.env.XDG_STATE_HOME
   stateDir = mkdtempSync(join(tmpdir(), "xsm-asksession-test-"))
   process.env.XDG_STATE_HOME = stateDir
+  transport = new FileTransport(fakeClient, "test-daemon")
 })
 
 afterEach(() => {
@@ -70,7 +81,7 @@ async function seedV1Target(sessionId: string): Promise<void> {
 describe("ask_session tool (file-based IPC)", () => {
   test("happy path: request file written, response file appears → returns reply text", async () => {
     await seedTarget("ses_target")
-    const t = createAskSessionTool()
+    const t = createAskSessionTool(transport)
     const promise = t.execute(
       { sessionId: "ses_target", question: "hello?", timeoutMs: 2000 },
       makeFakeCtx(),
@@ -92,7 +103,7 @@ describe("ask_session tool (file-based IPC)", () => {
   })
 
   test("self-ask forbidden → text error, no request file written", async () => {
-    const t = createAskSessionTool()
+    const t = createAskSessionTool(transport)
     const result = await t.execute(
       { sessionId: "ses_caller", question: "should not fire" },
       makeFakeCtx({ sessionID: "ses_caller" }),
@@ -102,7 +113,7 @@ describe("ask_session tool (file-based IPC)", () => {
   })
 
   test("not in registry → text error with list_sessions hint", async () => {
-    const t = createAskSessionTool()
+    const t = createAskSessionTool(transport)
     const result = await t.execute(
       { sessionId: "ses_ghost", question: "hi there" },
       makeFakeCtx(),
@@ -114,7 +125,7 @@ describe("ask_session tool (file-based IPC)", () => {
 
   test("v1 target (no daemonId) → text error advising re-register", async () => {
     await seedV1Target("ses_v1")
-    const t = createAskSessionTool()
+    const t = createAskSessionTool(transport)
     const result = await t.execute(
       { sessionId: "ses_v1", question: "hi there" },
       makeFakeCtx(),
@@ -126,7 +137,7 @@ describe("ask_session tool (file-based IPC)", () => {
 
   test("reply timeout: no response file appears → text error 'did not respond'", async () => {
     await seedTarget("ses_target")
-    const t = createAskSessionTool()
+    const t = createAskSessionTool(transport)
     const result = await t.execute(
       { sessionId: "ses_target", question: "hi there", timeoutMs: 300 },
       makeFakeCtx(),
@@ -137,7 +148,7 @@ describe("ask_session tool (file-based IPC)", () => {
 
   test("response file has error field → text error 'target session reported'", async () => {
     await seedTarget("ses_target")
-    const t = createAskSessionTool()
+    const t = createAskSessionTool(transport)
     const promise = t.execute(
       { sessionId: "ses_target", question: "hi there", timeoutMs: 2000 },
       makeFakeCtx(),
@@ -162,7 +173,7 @@ describe("ask_session tool (file-based IPC)", () => {
     await seedTarget("ses_target")
     const ctrl = new AbortController()
     setTimeout(() => ctrl.abort(), 50)
-    const t = createAskSessionTool()
+    const t = createAskSessionTool(transport)
     let result: unknown
     let threw = false
     try {
@@ -180,7 +191,7 @@ describe("ask_session tool (file-based IPC)", () => {
 
   test("cleanup: request file is deleted after completion", async () => {
     await seedTarget("ses_target")
-    const t = createAskSessionTool()
+    const t = createAskSessionTool(transport)
     const promise = t.execute(
       { sessionId: "ses_target", question: "hello?", timeoutMs: 2000 },
       makeFakeCtx(),

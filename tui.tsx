@@ -1,11 +1,99 @@
 /** @jsxImportSource @opentui/solid */
-import { createSignal, For, Show } from "solid-js"
+import { createSignal, For, onCleanup, Show } from "solid-js"
 import { useKeyboard } from "@opentui/solid"
 import type { TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { execSync } from "node:child_process"
-import { PLUGIN_ID } from "./src/constants.ts"
+import { hostname, networkInterfaces } from "node:os"
+import { PLUGIN_ID, RELAY_DEFAULT_PORT } from "./src/constants.ts"
 import { listEntries, removeEntry, upsertEntry } from "./src/registry.ts"
 import type { RegistryEntry } from "./src/types.ts"
+import type { RelayServer } from "./src/relay/server.ts"
+import { getRelayHistory, getRelayUrl, writeRelayUrl } from "./src/config.ts"
+
+let activeRelay: RelayServer | null = null
+
+interface PeerGroup {
+  device: string
+  count: number
+}
+
+const [relayInfo, setRelayInfo] = createSignal<{
+  port: number
+  localIp: string
+  peers: PeerGroup[]
+} | null>(null)
+
+const [clientInfo, setClientInfo] = createSignal<{
+  url: string
+  peers: PeerGroup[]
+} | null>(null)
+
+let relayPollTimer: ReturnType<typeof setInterval> | null = null
+let clientPollTimer: ReturnType<typeof setInterval> | null = null
+
+function startRelayPolling(): void {
+  if (relayPollTimer) return
+  updateRelayInfo()
+  relayPollTimer = setInterval(updateRelayInfo, 2_000)
+}
+
+function stopRelayPolling(): void {
+  if (relayPollTimer) {
+    clearInterval(relayPollTimer)
+    relayPollTimer = null
+  }
+  setRelayInfo(null)
+}
+
+function updateRelayInfo(): void {
+  if (!activeRelay) {
+    setRelayInfo(null)
+    return
+  }
+  setRelayInfo({
+    port: activeRelay.port,
+    localIp: getLocalIp(),
+    peers: activeRelay.peersByDevice,
+  })
+}
+
+function startClientPolling(): void {
+  if (clientPollTimer) return
+  updateClientInfo()
+  clientPollTimer = setInterval(updateClientInfo, 3_000)
+}
+
+function stopClientPolling(): void {
+  if (clientPollTimer) {
+    clearInterval(clientPollTimer)
+    clientPollTimer = null
+  }
+  setClientInfo(null)
+}
+
+function updateClientInfo(): void {
+  const url = getRelayUrl()
+  if (!url) {
+    setClientInfo(null)
+    return
+  }
+  const httpUrl = url.replace(/^ws(s?):\/\//, "http$1://")
+  fetch(`${httpUrl}/stats`)
+    .then((res) => res.json() as Promise<{ peers: PeerGroup[] }>)
+    .then((data) => setClientInfo({ url, peers: data.peers }))
+    .catch(() => setClientInfo({ url, peers: [] }))
+}
+
+function getLocalIp(): string {
+  const nets = networkInterfaces()
+  for (const ifaces of Object.values(nets)) {
+    if (!ifaces) continue
+    for (const iface of ifaces) {
+      if (iface.family === "IPv4" && !iface.internal) return iface.address
+    }
+  }
+  return "0.0.0.0"
+}
 
 function formatAge(ms: number): string {
   if (ms < 60_000) return `${Math.floor(ms / 1000)}s`
@@ -39,12 +127,15 @@ function formatSessionInfo(entry: RegistryEntry): string {
     `- Summary: ${entry.summary}`,
     `- Directory: ${entry.directory}`,
     `- Project: ${entry.projectId}`,
+    entry.deviceName ? `- Device: ${entry.deviceName}` : "",
     ``,
     `ask_session(sessionId="${entry.sessionId}", question="<your self-contained question here>")`,
     ``,
     `IMPORTANT: The target session CANNOT see your conversation history.`,
     `Include ALL necessary context (background, code snippets, constraints) in the question text itself.`,
-  ].join("\n")
+  ]
+    .filter(Boolean)
+    .join("\n")
 }
 
 function SessionRow(props: {
@@ -52,6 +143,7 @@ function SessionRow(props: {
   entry: RegistryEntry
   selected: boolean
   isSelf: boolean
+  isRemote: boolean
   confirming?: boolean
 }) {
   const theme = () => props.api.theme.current
@@ -66,6 +158,9 @@ function SessionRow(props: {
         </text>
         <Show when={props.isSelf}>
           <text fg={theme().success}>(this session)</text>
+        </Show>
+        <Show when={props.isRemote && props.entry.deviceName}>
+          <text fg={theme().info}>[{props.entry.deviceName}]</text>
         </Show>
         <text fg={theme().textMuted}>
           {formatAge(Date.now() - props.entry.updatedAt)} ago
@@ -99,11 +194,16 @@ function PeersPanel(props: {
 }) {
   const api = props.api
   const theme = () => api.theme.current
+  const localDevice = hostname()
   const [index, setIndex] = createSignal(0)
   const [entries, setEntries] = createSignal(props.entries)
   const [confirmingDelete, setConfirmingDelete] = createSignal<string | null>(
     null,
   )
+
+  function isRemote(entry: RegistryEntry): boolean {
+    return !!entry.deviceName && entry.deviceName !== localDevice
+  }
 
   function move(delta: number): void {
     setConfirmingDelete(null)
@@ -191,6 +291,9 @@ function PeersPanel(props: {
     }
   })
 
+  const localEntries = () => entries().filter((e) => !isRemote(e))
+  const remoteEntries = () => entries().filter((e) => isRemote(e))
+
   return (
     <box
       paddingTop={1}
@@ -208,26 +311,205 @@ function PeersPanel(props: {
           ↑↓ navigate · ⏎ copy · ⌫ remove · esc close
         </text>
       </box>
-      <For each={entries()}>
-        {(entry, i) => (
-          <SessionRow
-            api={api}
-            entry={entry}
-            selected={i() === index()}
-            isSelf={entry.sessionId === props.selfId}
-            confirming={confirmingDelete() === entry.sessionId}
-          />
-        )}
+
+      <Show when={localEntries().length > 0}>
+        <text fg={theme().textMuted}>
+          <b>Local ({localDevice})</b>
+        </text>
+      </Show>
+      <For each={localEntries()}>
+        {(entry) => {
+          const myIdx = entries().indexOf(entry)
+          return (
+            <SessionRow
+              api={api}
+              entry={entry}
+              selected={myIdx === index()}
+              isSelf={entry.sessionId === props.selfId}
+              isRemote={false}
+              confirming={confirmingDelete() === entry.sessionId}
+            />
+          )
+        }}
+      </For>
+
+      <Show when={remoteEntries().length > 0}>
+        <text fg={theme().info}>
+          <b>Remote</b>
+        </text>
+      </Show>
+      <For each={remoteEntries()}>
+        {(entry) => {
+          const myIdx = entries().indexOf(entry)
+          return (
+            <SessionRow
+              api={api}
+              entry={entry}
+              selected={myIdx === index()}
+              isSelf={entry.sessionId === props.selfId}
+              isRemote={true}
+              confirming={confirmingDelete() === entry.sessionId}
+            />
+          )
+        }}
       </For>
     </box>
   )
 }
+
+function RelayStatusPanel(props: {
+  api: TuiPluginApi
+  port: number
+  localIp: string
+}) {
+  const api = props.api
+  const theme = () => api.theme.current
+
+  const [peers, setPeers] = createSignal(activeRelay?.peersByDevice ?? [])
+  const timer = setInterval(() => {
+    if (activeRelay) setPeers(activeRelay.peersByDevice)
+  }, 1_000)
+  onCleanup(() => clearInterval(timer))
+
+  useKeyboard((evt) => {
+    if (evt.name === "q" || evt.name === "escape") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      api.ui.dialog.clear()
+      return
+    }
+    if (evt.name === "s") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      if (activeRelay) {
+        activeRelay.stop()
+        activeRelay = null
+        stopRelayPolling()
+        api.ui.dialog.clear()
+        api.ui.toast({ variant: "info", message: "Relay server stopped." })
+      }
+      return
+    }
+    if (evt.name === "c") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      const url = `ws://${props.localIp}:${props.port}`
+      if (copyToClipboard(url)) {
+        api.ui.toast({ variant: "success", message: `Copied: ${url}` })
+      }
+      return
+    }
+  })
+
+  return (
+    <box
+      paddingTop={1}
+      paddingBottom={1}
+      paddingLeft={2}
+      paddingRight={2}
+      gap={1}
+      flexDirection="column"
+    >
+      <text fg={theme().text}>
+        <b>Relay Server</b>
+      </text>
+      <box flexDirection="column" paddingLeft={2} gap={0}>
+        <box flexDirection="row" gap={1}>
+          <text fg={theme().textMuted}>Listen:</text>
+          <text fg={theme().primary}>
+            ws://{props.localIp}:{props.port}
+          </text>
+        </box>
+      </box>
+      <Show when={peers().length > 0}>
+        <box flexDirection="column" paddingLeft={2} paddingTop={1}>
+          <For each={peers()}>
+            {(pg) => (
+              <box flexDirection="row" gap={1}>
+                <text fg={theme().text}>{pg.device}</text>
+                <text fg={theme().textMuted}>
+                  ({pg.count} {pg.count === 1 ? "peer" : "peers"})
+                </text>
+              </box>
+            )}
+          </For>
+        </box>
+      </Show>
+      <text fg={theme().textMuted}>c copy URL · s stop · esc close</text>
+      <box paddingTop={1}>
+        <text fg={theme().textMuted}>
+          On other machines: /join ws://{props.localIp}:{props.port}
+        </text>
+      </box>
+    </box>
+  )
+}
+
+
 
 const plugin: TuiPluginModule = {
   id: PLUGIN_ID,
   tui: async (api) => {
     const command = api.command
     if (!command) return
+
+    startClientPolling()
+    api.lifecycle.onDispose(() => {
+      stopClientPolling()
+      stopRelayPolling()
+    })
+
+    api.slots.register({
+      slots: {
+        sidebar_title: (ctx) => {
+          const server = relayInfo()
+          const client = clientInfo()
+          if (!server && !client) return <></>
+          const theme = ctx.theme.current
+          const peers = server?.peers ?? client?.peers ?? []
+          const totalPeers = peers.reduce((s, p) => s + p.count, 0)
+          return (
+            <box flexDirection="column" paddingLeft={1} paddingBottom={1}>
+              <Show when={server}>
+                <text fg={theme.primary}>
+                  <b>⚡ Relay :{server!.port}</b>
+                </text>
+                <text fg={theme.textMuted}>
+                  ws://{server!.localIp}:{server!.port}
+                </text>
+              </Show>
+              <Show when={!server && client}>
+                <text fg={theme.primary}>
+                  <b>⚡ Relay</b>
+                </text>
+                <text fg={theme.textMuted}>{client!.url}</text>
+              </Show>
+              <Show
+                when={peers.length > 0}
+                fallback={
+                  <text fg={theme.textMuted}>
+                    {server ? "waiting for peers..." : "no peers"}
+                  </text>
+                }
+              >
+                <text fg={theme.text}>
+                  {totalPeers} {totalPeers === 1 ? "peer" : "peers"}
+                </text>
+                <box flexDirection="column" paddingLeft={2}>
+                  <For each={peers}>
+                    {(pg) => (
+                      <text fg={theme.textMuted}>
+                        {pg.device} ({pg.count})
+                      </text>
+                    )}
+                  </For>
+                </box>
+              </Show>
+            </box>
+          )
+        },
+      },
+    })
 
     command.register(() => [
       {
@@ -245,7 +527,7 @@ const plugin: TuiPluginModule = {
               })
               return
             }
-            api.ui.dialog.setSize("medium")
+            api.ui.dialog.setSize("large")
             api.ui.dialog.replace(() => (
               <PeersPanel api={api} entries={entries} />
             ))
@@ -311,6 +593,149 @@ const plugin: TuiPluginModule = {
               onCancel={() => api.ui.dialog.clear()}
             />
           ))
+        },
+      },
+      {
+        title: "Start/stop relay server",
+        value: `${PLUGIN_ID}.relay`,
+        category: "Sessions",
+        slash: { name: "relay" },
+        onSelect: async () => {
+          if (activeRelay) {
+            const localIp = getLocalIp()
+            api.ui.dialog.setSize("medium")
+            api.ui.dialog.replace(() => (
+              <RelayStatusPanel
+                api={api}
+                port={activeRelay!.port}
+                localIp={localIp}
+              />
+            ))
+            return
+          }
+
+          api.ui.dialog.setSize("medium")
+          api.ui.dialog.replace(() => (
+            <api.ui.DialogPrompt
+              title="Start Relay Server"
+              placeholder={`Port (default: ${RELAY_DEFAULT_PORT})`}
+              value={String(RELAY_DEFAULT_PORT)}
+              onConfirm={async (portStr: string) => {
+                api.ui.dialog.clear()
+                const port =
+                  parseInt(portStr.trim(), 10) || RELAY_DEFAULT_PORT
+                if (port < 1024 || port > 65535) {
+                  api.ui.toast({
+                    variant: "error",
+                    message: "Port must be between 1024 and 65535.",
+                  })
+                  return
+                }
+                try {
+                  const { RelayServer } = await import(
+                    "./src/relay/server.ts"
+                  )
+                  activeRelay = new RelayServer(port)
+                  activeRelay.start()
+                  startRelayPolling()
+                  const localIp = getLocalIp()
+                  api.ui.toast({
+                    variant: "success",
+                    message: `Relay started on ws://${localIp}:${port}`,
+                  })
+                } catch (error) {
+                  activeRelay = null
+                  api.ui.toast({
+                    variant: "error",
+                    message: `Failed to start relay: ${error instanceof Error ? error.message : String(error)}`,
+                  })
+                }
+              }}
+              onCancel={() => api.ui.dialog.clear()}
+            />
+          ))
+        },
+      },
+      {
+        title: "Join a relay server",
+        value: `${PLUGIN_ID}.join`,
+        category: "Sessions",
+        slash: { name: "join" },
+        onSelect: async () => {
+          const history = getRelayHistory()
+
+          const doJoin = async (url: string) => {
+            api.ui.dialog.clear()
+            const trimmed = url.trim()
+            if (
+              !trimmed.startsWith("ws://") &&
+              !trimmed.startsWith("wss://")
+            ) {
+              api.ui.toast({
+                variant: "error",
+                message: "URL must start with ws:// or wss://",
+              })
+              return
+            }
+            try {
+              await writeRelayUrl(trimmed)
+              api.ui.toast({
+                variant: "success",
+                message: `Connecting to ${trimmed}...`,
+              })
+            } catch (error) {
+              api.ui.toast({
+                variant: "error",
+                message: `Failed: ${error instanceof Error ? error.message : String(error)}`,
+              })
+            }
+          }
+
+          if (history.length > 0) {
+            const options = [
+              ...history.map((url) => ({
+                title: url,
+                value: url,
+                description: "Reconnect",
+              })),
+              {
+                title: "Enter new URL...",
+                value: "__new__",
+                description: "Join a different relay",
+              },
+            ]
+            api.ui.dialog.setSize("medium")
+            api.ui.dialog.replace(() => (
+              <api.ui.DialogSelect
+                title="Join Relay"
+                options={options}
+                onSelect={(opt) => {
+                  if (opt.value === "__new__") {
+                    api.ui.dialog.replace(() => (
+                      <api.ui.DialogPrompt
+                        title="Join Relay"
+                        placeholder="ws://192.168.1.100:7351"
+                        onConfirm={(url: string) => void doJoin(url)}
+                        onCancel={() => api.ui.dialog.clear()}
+                      />
+                    ))
+                  } else {
+                    void doJoin(opt.value as string)
+                  }
+                }}
+              />
+            ))
+          } else {
+            api.ui.dialog.setSize("medium")
+            api.ui.dialog.replace(() => (
+              <api.ui.DialogPrompt
+                title="Join Relay"
+                placeholder="ws://192.168.1.100:7351"
+                onConfirm={(url: string) => void doJoin(url)}
+                onCancel={() => api.ui.dialog.clear()}
+              />
+            ))
+          }
         },
       },
     ])

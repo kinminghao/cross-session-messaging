@@ -4,6 +4,15 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { readRegistry } from "../registry.ts"
 import { createRegisterSessionTool } from "./registerSession.ts"
+import { FileTransport } from "../transport/file.ts"
+import type { AskClient } from "../askAndWaitForReply.ts"
+
+const fakeClient: AskClient = {
+  session: {
+    async promptAsync() {},
+    async messages() { return [] },
+  },
+}
 
 function makeFakeCtx(overrides: {
   sessionID?: string
@@ -33,11 +42,13 @@ function asStructured(result: unknown): { title: string; output: string } {
 
 let stateDir: string
 let originalXDG: string | undefined
+let transport: FileTransport
 
 beforeEach(() => {
   originalXDG = process.env.XDG_STATE_HOME
   stateDir = mkdtempSync(join(tmpdir(), "xsm-register-test-"))
   process.env.XDG_STATE_HOME = stateDir
+  transport = new FileTransport(fakeClient, "test-daemon")
 })
 
 afterEach(() => {
@@ -48,10 +59,11 @@ afterEach(() => {
 
 describe("register_session tool", () => {
   test("fresh upsert: creates entry with all fields incl. daemonId", async () => {
-    const t = createRegisterSessionTool({
+    const t = createRegisterSessionTool(transport, {
       projectId: "p_test",
       serverUrl: "http://localhost:9999",
       daemonId: "daemon-1",
+      deviceName: "test-host",
     })
     await t.execute(
       { summary: "working on the auth module" },
@@ -69,10 +81,11 @@ describe("register_session tool", () => {
   })
 
   test("re-upsert: preserves registeredAt, bumps updatedAt, updates daemonId on restart", async () => {
-    const t1 = createRegisterSessionTool({
+    const t1 = createRegisterSessionTool(transport, {
       projectId: "p_test",
       serverUrl: "http://localhost:9999",
       daemonId: "daemon-old",
+      deviceName: "test-host",
     })
     await t1.execute(
       { summary: "first task" },
@@ -80,10 +93,11 @@ describe("register_session tool", () => {
     )
     const before = (await readRegistry()).sessions.ses_a!
     await new Promise((r) => setTimeout(r, 10))
-    const t2 = createRegisterSessionTool({
+    const t2 = createRegisterSessionTool(transport, {
       projectId: "p_test",
       serverUrl: "http://localhost:8888",
       daemonId: "daemon-new",
+      deviceName: "test-host",
     })
     await t2.execute(
       { summary: "updated task" },
@@ -97,10 +111,11 @@ describe("register_session tool", () => {
   })
 
   test("whitespace-only summary: returns text error, does NOT throw", async () => {
-    const t = createRegisterSessionTool({
+    const t = createRegisterSessionTool(transport, {
       projectId: "p_test",
       serverUrl: "http://localhost:9999",
       daemonId: "daemon-1",
+      deviceName: "test-host",
     })
     let threw = false
     let result: unknown
@@ -114,10 +129,11 @@ describe("register_session tool", () => {
   })
 
   test("different session IDs produce separate entries", async () => {
-    const t = createRegisterSessionTool({
+    const t = createRegisterSessionTool(transport, {
       projectId: "p_test",
       serverUrl: "http://localhost:9999",
       daemonId: "daemon-1",
+      deviceName: "test-host",
     })
     await t.execute(
       { summary: "task 1 in session 1" },
@@ -132,10 +148,11 @@ describe("register_session tool", () => {
   })
 
   test("directory from ctx is persisted", async () => {
-    const t = createRegisterSessionTool({
+    const t = createRegisterSessionTool(transport, {
       projectId: "p_test",
       serverUrl: "http://localhost:9999",
       daemonId: "daemon-1",
+      deviceName: "test-host",
     })
     await t.execute(
       { summary: "some task" },

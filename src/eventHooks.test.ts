@@ -4,14 +4,25 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createEventHandler } from "./eventHooks.ts"
 import { readRegistry, upsertEntry } from "./registry.ts"
+import { FileTransport } from "./transport/file.ts"
+import type { AskClient } from "./askAndWaitForReply.ts"
+
+const fakeClient: AskClient = {
+  session: {
+    async promptAsync() {},
+    async messages() { return [] },
+  },
+}
 
 let stateDir: string
 let originalXDG: string | undefined
+let transport: FileTransport
 
 beforeEach(() => {
   originalXDG = process.env.XDG_STATE_HOME
   stateDir = mkdtempSync(join(tmpdir(), "xsm-events-test-"))
   process.env.XDG_STATE_HOME = stateDir
+  transport = new FileTransport(fakeClient, "test-daemon")
 })
 
 afterEach(() => {
@@ -34,7 +45,7 @@ describe("createEventHandler", () => {
     await seed("ses_a")
     await seed("ses_b")
     await seed("ses_c")
-    const handler = createEventHandler()
+    const handler = createEventHandler(transport)
     await handler({
       event: {
         type: "session.deleted",
@@ -49,7 +60,7 @@ describe("createEventHandler", () => {
 
   test("unrelated event types do not touch the registry", async () => {
     await seed("ses_a")
-    const handler = createEventHandler()
+    const handler = createEventHandler(transport)
     await handler({
       event: {
         type: "session.idle",
@@ -64,7 +75,7 @@ describe("createEventHandler", () => {
   })
 
   test("session.deleted for an absent session is a silent no-op", async () => {
-    const handler = createEventHandler()
+    const handler = createEventHandler(transport)
     let threw = false
     try {
       await handler({
@@ -83,7 +94,7 @@ describe("createEventHandler", () => {
 
   test("malformed session.deleted events (missing/empty id) never throw and never prune", async () => {
     await seed("ses_a")
-    const handler = createEventHandler()
+    const handler = createEventHandler(transport)
     let threw = false
     try {
       await handler({ event: { type: "session.deleted" } })
@@ -116,7 +127,7 @@ describe("createEventHandler", () => {
     await seed("ses_a")
     await seed("ses_b")
     await seed("ses_c")
-    const handler = createEventHandler()
+    const handler = createEventHandler(transport)
     await Promise.all([
       handler({
         event: {

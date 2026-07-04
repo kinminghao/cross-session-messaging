@@ -1,15 +1,12 @@
 import { tool } from "@opencode-ai/plugin/tool"
-import { listEntries } from "../registry.ts"
 import { log } from "../logger.ts"
+import type { RegistryEntry } from "../types.ts"
+import type { ITransport } from "../transport/interface.ts"
 
-/**
- * `list_sessions` — return live registry entries so the calling LLM
- * can pick a target for `ask_session`. Corresponds to executable plan §T12.
- *
- * Stale filtering (`updatedAt` older than 24h) is done inside
- * `listEntries` — the tool receives already-filtered, already-sorted data.
- */
-export function createListSessionsTool(): ReturnType<typeof tool> {
+export function createListSessionsTool(
+  transport: ITransport,
+  localDeviceName: string,
+): ReturnType<typeof tool> {
   return tool({
     description: [
       "List active peer sessions in the registry, most recent first.",
@@ -25,26 +22,52 @@ export function createListSessionsTool(): ReturnType<typeof tool> {
     },
     async execute(args, ctx) {
       try {
-        const entries = await listEntries()
+        const entries = await transport.list()
         const filtered = args.includeSelf
           ? entries
           : entries.filter((e) => e.sessionId !== ctx.sessionID)
         if (filtered.length === 0) {
           return { title: "0 sessions", output: "No sessions registered." }
         }
+
+        const local: RegistryEntry[] = []
+        const remoteByDevice = new Map<string, RegistryEntry[]>()
+
+        for (const e of filtered) {
+          const device = e.deviceName ?? "unknown"
+          if (!e.deviceName || device === localDeviceName) {
+            local.push(e)
+          } else {
+            let group = remoteByDevice.get(device)
+            if (!group) {
+              group = []
+              remoteByDevice.set(device, group)
+            }
+            group.push(e)
+          }
+        }
+
         const now = Date.now()
-        const lines = filtered.map((e, i) => {
-          const age = formatAge(now - e.updatedAt)
-          return (
-            `${i + 1}. **${e.sessionId}** [project ${e.projectId}]\n` +
-            `   Directory: ${e.directory}\n` +
-            `   Summary: ${e.summary}\n` +
-            `   Updated: ${age} ago`
-          )
-        })
+        const sections: string[] = []
+        let idx = 1
+
+        if (local.length > 0) {
+          sections.push(`## Local (${localDeviceName})`)
+          for (const e of local) {
+            sections.push(formatEntry(e, idx++, now))
+          }
+        }
+
+        for (const [device, group] of remoteByDevice) {
+          sections.push(`\n## Remote — ${device}`)
+          for (const e of group) {
+            sections.push(formatEntry(e, idx++, now))
+          }
+        }
+
         return {
           title: `${filtered.length} session(s)`,
-          output: `Active sessions (${filtered.length}):\n\n${lines.join("\n\n")}`,
+          output: `Active sessions (${filtered.length}):\n\n${sections.join("\n\n")}`,
         }
       } catch (error) {
         log.warn("list_sessions:fail", { error: String(error) })
@@ -55,6 +78,16 @@ export function createListSessionsTool(): ReturnType<typeof tool> {
       }
     },
   })
+}
+
+function formatEntry(e: RegistryEntry, idx: number, now: number): string {
+  const age = formatAge(now - e.updatedAt)
+  return (
+    `${idx}. **${e.sessionId}** [project ${e.projectId}]\n` +
+    `   Directory: ${e.directory}\n` +
+    `   Summary: ${e.summary}\n` +
+    `   Updated: ${age} ago`
+  )
 }
 
 function formatAge(ms: number): string {

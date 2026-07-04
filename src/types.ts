@@ -21,6 +21,7 @@ export interface RegistryEntry {
   serverUrl?: string
   /** Routing — random UUID generated per daemon startup; inbox watcher only processes requests where target's daemonId matches its own. */
   daemonId?: string
+  deviceName?: string
   registeredAt: number
   updatedAt: number
 }
