@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto"
 import { hostname } from "node:os"
 import { askAndWaitForReply, type AskClient } from "./askAndWaitForReply.ts"
 import { getRelayUrl, writeRelayUrl } from "./config.ts"
-import { PLUGIN_ID, SESSION_DISCOVERY_MS } from "./constants.ts"
+import { PLUGIN_ID } from "./constants.ts"
 import { createEventHandler } from "./eventHooks.ts"
 import { initLogger, log } from "./logger.ts"
 import { createAskSessionTool } from "./tools/askSession.ts"
@@ -51,58 +51,6 @@ const plugin: PluginModule = {
     transport.startInbox((sessionId, question, opts) =>
       askAndWaitForReply(client, sessionId, question, opts),
     )
-
-    interface DiscoveredSession {
-      id: string
-      title: string
-      projectID: string
-      directory: string
-    }
-
-    const processedIds = new Set<string>()
-    const discoveryPoller = setInterval(async () => {
-      try {
-        const sessions = (await input.client.session.list({
-          throwOnError: true,
-          responseStyle: "data",
-        })) as unknown as DiscoveredSession[]
-
-        const currentIds = new Set<string>()
-        for (const s of sessions) {
-          currentIds.add(s.id)
-          if (processedIds.has(s.id)) continue
-          processedIds.add(s.id)
-          try {
-            await transport.register({
-              sessionId: s.id,
-              summary: s.title || `Session ${s.id.slice(0, 8)}`,
-              directory: s.directory || input.directory,
-              projectId: s.projectID || input.project.id,
-              serverUrl: input.serverUrl.toString(),
-              daemonId,
-              deviceName: device,
-            })
-          } catch {
-            /* skip individual failures */
-          }
-        }
-
-        for (const id of processedIds) {
-          if (!currentIds.has(id)) {
-            processedIds.delete(id)
-            try {
-              await transport.remove(id)
-            } catch {
-              /* skip */
-            }
-          }
-        }
-      } catch (err) {
-        log.warn("discovery:fail", {
-          error: err instanceof Error ? err.message : String(err),
-        })
-      }
-    }, SESSION_DISCOVERY_MS)
 
     let lastKnownUrl = relayUrl
     const configPoller = setInterval(() => {
@@ -180,7 +128,6 @@ const plugin: PluginModule = {
       event: createEventHandler(transport),
 
       dispose: async () => {
-        clearInterval(discoveryPoller)
         clearInterval(configPoller)
         await transport.dispose()
         log.info("plugin:dispose")
