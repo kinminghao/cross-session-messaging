@@ -1,3 +1,4 @@
+import { log } from "../logger.ts"
 import type { RegistryEntry } from "../types.ts"
 import type { ITransport, InboxHandler } from "./interface.ts"
 
@@ -18,19 +19,35 @@ export class DelegatingTransport implements ITransport {
   }
 
   async switchTo(transport: ITransport): Promise<void> {
+    const from = this._inner.constructor.name
+    const to = transport.constructor.name
+    log.info("delegating:switchTo", {
+      from,
+      to,
+      trackedSessions: this._tracked.size,
+      hasInboxHandler: !!this._inboxHandler,
+    })
     await this._inner.stopInbox()
     await this._inner.dispose()
     this._inner = transport
     for (const entry of this._tracked.values()) {
       try {
         await transport.register(entry)
-      } catch {
-        /* noop */
+        log.info("delegating:switchTo:re-register", {
+          sessionId: entry.sessionId,
+        })
+      } catch (err) {
+        log.warn("delegating:switchTo:re-register-fail", {
+          sessionId: entry.sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        })
       }
     }
     if (this._inboxHandler) {
       transport.startInbox(this._inboxHandler)
+      log.info("delegating:switchTo:inbox-restarted")
     }
+    log.info("delegating:switchTo:done", { to })
   }
 
   async register(

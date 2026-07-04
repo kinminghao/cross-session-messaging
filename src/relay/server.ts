@@ -6,6 +6,8 @@ import type { ServerMessage } from "./protocol.ts"
 const CLIENT_STALE_MS = 30_000
 const CLEANUP_INTERVAL_MS = 10_000
 
+const tag = "[relay]"
+
 interface PendingAsk {
   callerClientId: string
   targetSessionId: string
@@ -70,7 +72,7 @@ export class RelayServer {
       () => this.cleanupStaleClients(),
       CLEANUP_INTERVAL_MS,
     )
-    console.log(`[relay] listening on 0.0.0.0:${this.port}`)
+    console.log(`${tag} listening on 0.0.0.0:${this.port}`)
   }
 
   stop(): void {
@@ -88,7 +90,7 @@ export class RelayServer {
     this.clientIps.clear()
     this.clientQueues.clear()
     this.pendingAsks.clear()
-    console.log("[relay] stopped")
+    console.log(`${tag} stopped`)
   }
 
   private async handleRequest(
@@ -116,6 +118,9 @@ export class RelayServer {
       }
 
       if (req.method !== "POST") {
+        console.log(
+          `${tag} rejected ${req.method} ${path} (method not allowed)`,
+        )
         return Response.json(
           { error: "method not allowed" },
           { status: 405 },
@@ -126,6 +131,7 @@ export class RelayServer {
       try {
         body = (await req.json()) as Record<string, unknown>
       } catch {
+        console.log(`${tag} rejected POST ${path} (invalid JSON)`)
         return Response.json(
           { error: "invalid JSON body" },
           { status: 400 },
@@ -134,6 +140,7 @@ export class RelayServer {
 
       const clientId = body.clientId as string | undefined
       if (!clientId) {
+        console.log(`${tag} rejected POST ${path} (missing clientId)`)
         return Response.json(
           { error: "clientId required" },
           { status: 400 },
@@ -141,25 +148,29 @@ export class RelayServer {
       }
 
       this.touchClient(clientId, req, server)
+      const cid = clientId.slice(0, 8)
 
       switch (path) {
         case "/api/register":
-          return this.handleRegister(clientId, body)
+          return this.handleRegister(clientId, cid, body)
         case "/api/unregister":
-          return this.handleUnregister(clientId, body)
+          return this.handleUnregister(clientId, cid, body)
         case "/api/list":
-          return this.handleList(body)
+          return this.handleList(cid, body)
         case "/api/lookup":
-          return this.handleLookup(body)
+          return this.handleLookup(cid, body)
         case "/api/ask":
-          return this.handleAsk(clientId, body)
+          return this.handleAsk(clientId, cid, body)
         case "/api/reply":
-          return this.handleReply(body)
+          return this.handleReply(cid, body)
         default:
+          console.log(`${tag} 404 POST ${path} from ${cid}`)
           return Response.json({ error: "not found" }, { status: 404 })
       }
     } catch (err) {
-      console.error(`[relay] request error: ${(err as Error).message}`)
+      console.error(
+        `${tag} request error: ${(err as Error).message}`,
+      )
       return Response.json(
         { error: `internal error: ${(err as Error).message}` },
         { status: 500 },
@@ -172,6 +183,7 @@ export class RelayServer {
     req: Request,
     server: Server<undefined>,
   ): void {
+    const isNew = !this.clientLastSeen.has(clientId)
     this.clientLastSeen.set(clientId, Date.now())
     try {
       const addr = server.requestIP(req)
@@ -185,6 +197,12 @@ export class RelayServer {
     if (!this.clientQueues.has(clientId)) {
       this.clientQueues.set(clientId, [])
     }
+    if (isNew) {
+      const ip = this.clientIps.get(clientId) ?? "unknown"
+      console.log(
+        `${tag} new client ${clientId.slice(0, 8)} from ${ip} (total=${this.clientLastSeen.size})`,
+      )
+    }
   }
 
   private handlePoll(clientId: string): Response {
@@ -194,11 +212,15 @@ export class RelayServer {
     }
     const messages = [...queue]
     queue.length = 0
+    console.log(
+      `${tag} poll ${clientId.slice(0, 8)} → ${messages.length} msg(s): [${messages.map((m) => m.type).join(", ")}]`,
+    )
     return Response.json({ messages })
   }
 
   private handleRegister(
     clientId: string,
+    cid: string,
     body: Record<string, unknown>,
   ): Response {
     const sessionId = body.sessionId as string
@@ -219,6 +241,9 @@ export class RelayServer {
     const oldOwner = this.sessionToClient.get(sessionId)
     if (oldOwner && oldOwner !== clientId) {
       this.clientToSessions.get(oldOwner)?.delete(sessionId)
+      console.log(
+        `${tag} register: session ${sessionId} moved from client ${oldOwner.slice(0, 8)} to ${cid}`,
+      )
     }
 
     this.sessions.set(sessionId, entry)
@@ -228,19 +253,23 @@ export class RelayServer {
     this.clientToSessions.set(clientId, owned)
 
     console.log(
-      `[relay] registered ${sessionId} (client=${clientId.slice(0, 8)})`,
+      `${tag} registered ${sessionId} (client=${cid}, device=${entry.deviceName ?? "?"}, sessions=${this.sessions.size})`,
     )
     return Response.json({ type: "registered", sessionId, entry })
   }
 
   private handleUnregister(
     clientId: string,
+    cid: string,
     body: Record<string, unknown>,
   ): Response {
     const sessionId = body.sessionId as string
     const existed = this.sessions.delete(sessionId)
     this.sessionToClient.delete(sessionId)
     this.clientToSessions.get(clientId)?.delete(sessionId)
+    console.log(
+      `${tag} unregistered ${sessionId} (client=${cid}, existed=${existed}, sessions=${this.sessions.size})`,
+    )
     return Response.json({
       type: "unregistered",
       sessionId,
@@ -248,33 +277,50 @@ export class RelayServer {
     })
   }
 
-  private handleList(body: Record<string, unknown>): Response {
+  private handleList(
+    cid: string,
+    body: Record<string, unknown>,
+  ): Response {
     const requestId = body.requestId as string
     const cutoff = Date.now() - STALE_ENTRY_TTL_MS
     const entries = [...this.sessions.values()]
       .filter((e) => e.updatedAt >= cutoff)
       .sort((a, b) => b.updatedAt - a.updatedAt)
+    console.log(
+      `${tag} list (client=${cid}) → ${entries.length} session(s)`,
+    )
     return Response.json({ type: "sessions", requestId, entries })
   }
 
-  private handleLookup(body: Record<string, unknown>): Response {
+  private handleLookup(
+    cid: string,
+    body: Record<string, unknown>,
+  ): Response {
     const requestId = body.requestId as string
     const sessionId = body.sessionId as string
     const entry = this.sessions.get(sessionId) ?? null
+    console.log(
+      `${tag} lookup ${sessionId} (client=${cid}) → ${entry ? "found" : "not found"}`,
+    )
     return Response.json({ type: "looked-up", requestId, entry })
   }
 
   private handleAsk(
     clientId: string,
+    cid: string,
     body: Record<string, unknown>,
   ): Response {
     const requestId = body.requestId as string
     const toSessionId = body.toSessionId as string
     const question = body.question as string
     const timeoutMs = body.timeoutMs as number
+    const rid = requestId.slice(0, 8)
 
     const targetClientId = this.sessionToClient.get(toSessionId)
     if (!targetClientId) {
+      console.log(
+        `${tag} ask ${rid} from ${cid} → target ${toSessionId} NOT FOUND`,
+      )
       return Response.json({
         ok: false,
         error: `Target session ${toSessionId} not found`,
@@ -299,16 +345,26 @@ export class RelayServer {
       timeoutMs,
     })
 
+    console.log(
+      `${tag} ask ${rid}: ${fromSessionId} → ${toSessionId} (target-client=${targetClientId.slice(0, 8)}, qLen=${question.length}, timeout=${timeoutMs}ms)`,
+    )
     return Response.json({ ok: true })
   }
 
-  private handleReply(body: Record<string, unknown>): Response {
+  private handleReply(
+    cid: string,
+    body: Record<string, unknown>,
+  ): Response {
     const requestId = body.requestId as string
     const reply = body.reply as string | undefined
     const error = body.error as string | undefined
+    const rid = requestId.slice(0, 8)
 
     const pending = this.pendingAsks.get(requestId)
     if (!pending) {
+      console.log(
+        `${tag} reply ${rid} from ${cid} → no pending ask (stale/duplicate)`,
+      )
       return Response.json({ ok: true })
     }
 
@@ -320,6 +376,9 @@ export class RelayServer {
       error,
     })
 
+    console.log(
+      `${tag} reply ${rid} from ${cid} → queued to ${pending.callerClientId.slice(0, 8)} (replyLen=${reply?.length ?? 0}, error=${error ?? "none"})`,
+    )
     return Response.json({ ok: true })
   }
 
@@ -362,7 +421,7 @@ export class RelayServer {
       this.clientQueues.delete(clientId)
 
       console.log(
-        `[relay] cleaned up stale client ${clientId.slice(0, 8)} (${owned.size} sessions)`,
+        `${tag} cleanup: stale client ${clientId.slice(0, 8)} removed (${owned.size} sessions, remaining clients=${this.clientLastSeen.size})`,
       )
     }
   }
