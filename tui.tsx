@@ -143,6 +143,15 @@ function formatSessionInfo(entry: RegistryEntry): string {
     .join("\n")
 }
 
+function truncate(s: string, max: number): string {
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`
+}
+
+function shortDir(dir: string): string {
+  const parts = dir.split("/")
+  return parts.length <= 3 ? dir : `…/${parts.slice(-2).join("/")}`
+}
+
 function SessionRow(props: {
   api: TuiPluginApi
   entry: RegistryEntry
@@ -152,42 +161,23 @@ function SessionRow(props: {
   confirming?: boolean
 }) {
   const theme = () => props.api.theme.current
+  const e = props.entry
   return (
-    <box flexDirection="column">
-      <box flexDirection="row" gap={1}>
-        <text fg={props.selected ? theme().primary : theme().textMuted}>
-          {props.selected ? "▶" : " "}
-        </text>
-        <text fg={props.selected ? theme().primary : theme().text}>
-          {props.entry.sessionId}
-        </text>
-        <Show when={props.isSelf}>
-          <text fg={theme().success}>(this session)</text>
-        </Show>
-        <Show when={props.isRemote && props.entry.deviceName}>
-          <text fg={theme().info}>[{props.entry.deviceName}]</text>
-        </Show>
-        <text fg={theme().textMuted}>
-          {formatAge(Date.now() - props.entry.updatedAt)} ago
-        </text>
-        <Show when={props.confirming}>
-          <text fg={theme().error}>⚠ press delete again to confirm</text>
-        </Show>
-      </box>
-      <box flexDirection="column" paddingLeft={4}>
-        <box flexDirection="row" gap={1}>
-          <text fg={theme().textMuted}>Summary:</text>
-          <text fg={theme().text}>{props.entry.summary}</text>
-        </box>
-        <box flexDirection="row" gap={1}>
-          <text fg={theme().textMuted}>Dir:</text>
-          <text fg={theme().text}>{props.entry.directory}</text>
-        </box>
-        <box flexDirection="row" gap={1}>
-          <text fg={theme().textMuted}>Project:</text>
-          <text fg={theme().text}>{props.entry.projectId}</text>
-        </box>
-      </box>
+    <box flexDirection="row" gap={1}>
+      <text fg={props.selected ? theme().primary : theme().textMuted}>
+        {props.selected ? "▶" : " "}
+      </text>
+      <text fg={props.selected ? theme().primary : theme().text}>
+        {truncate(e.summary || e.sessionId, 40)}
+      </text>
+      <Show when={props.isSelf}>
+        <text fg={theme().success}>★</text>
+      </Show>
+      <text fg={theme().textMuted}>{shortDir(e.directory)}</text>
+      <text fg={theme().textMuted}>{formatAge(Date.now() - e.updatedAt)}</text>
+      <Show when={props.confirming}>
+        <text fg={theme().error}>⚠ delete?</text>
+      </Show>
     </box>
   )
 }
