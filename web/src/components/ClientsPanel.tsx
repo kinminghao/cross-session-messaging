@@ -4,15 +4,15 @@ import type { ClientInfo } from "../types"
 export function ClientsPanel(props: { clients: ClientInfo[] }) {
   return (
     <section class="panel clients-panel">
-      <h2>Clients ({props.clients.length})</h2>
-      <Show when={props.clients.length > 0} fallback={<p class="empty">No clients connected</p>}>
+      <h2>客户端连接 ({props.clients.length})</h2>
+      <Show when={props.clients.length > 0} fallback={<p class="empty">暂无客户端连接</p>}>
         <table class="clients-table">
           <thead>
             <tr>
-              <th>Client ID</th>
-              <th>IP</th>
-              <th>Sessions</th>
-              <th>Last Seen</th>
+              <th>客户端</th>
+              <th>地址</th>
+              <th>会话数</th>
+              <th>最后心跳</th>
             </tr>
           </thead>
           <tbody>
@@ -34,7 +34,7 @@ export function ClientsPanel(props: { clients: ClientInfo[] }) {
 }
 
 function formatAge(ms: number): string {
-  if (ms < 60_000) return `${Math.floor(ms / 1000)}s ago`
-  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`
-  return `${Math.floor(ms / 3_600_000)}h ago`
+  if (ms < 60_000) return `${Math.floor(ms / 1000)} 秒前`
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)} 分钟前`
+  return `${Math.floor(ms / 3_600_000)} 小时前`
 }

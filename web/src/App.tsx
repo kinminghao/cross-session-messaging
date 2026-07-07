@@ -106,9 +106,9 @@ export default function App() {
   return (
     <div class="dashboard">
       <header class="header">
-        <h1>Relay Dashboard</h1>
+        <h1>中继服务控制台</h1>
         <span class={`status ${connected() ? "connected" : "disconnected"}`}>
-          {connected() ? "Connected" : "Disconnected"}
+          {connected() ? "已连接" : "未连接"}
         </span>
       </header>
       <Overview sessions={sessions()} clients={clients()} pendingAsks={pendingAsks()} />

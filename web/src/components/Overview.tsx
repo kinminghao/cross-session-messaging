@@ -9,19 +9,19 @@ export function Overview(props: {
     <div class="overview">
       <div class="stat-card">
         <span class="stat-value">{props.sessions.length}</span>
-        <span class="stat-label">Sessions</span>
+        <span class="stat-label">会话</span>
       </div>
       <div class="stat-card">
         <span class="stat-value">{props.clients.length}</span>
-        <span class="stat-label">Clients</span>
+        <span class="stat-label">客户端</span>
       </div>
       <div class="stat-card">
         <span class="stat-value">{props.pendingAsks.length}</span>
-        <span class="stat-label">Pending Asks</span>
+        <span class="stat-label">等待中</span>
       </div>
       <div class="stat-card">
         <span class="stat-value">{deviceCount(props.sessions)}</span>
-        <span class="stat-label">Devices</span>
+        <span class="stat-label">设备</span>
       </div>
     </div>
   )
