@@ -1,122 +1,179 @@
-import type { Server } from "bun"
-import { appendFileSync, mkdirSync } from "node:fs"
-import { dirname, join } from "node:path"
-import { RELAY_DEFAULT_PORT, STALE_ENTRY_TTL_MS } from "../constants.ts"
-import type { RegistryEntry } from "../types.ts"
+import type { Server, ServerWebSocket } from "bun"
+import { appendFileSync, existsSync, mkdirSync } from "node:fs"
+import { dirname, join, resolve } from "node:path"
+import { RELAY_DEFAULT_PORT } from "../constants.ts"
 import { getStateDir } from "../xdg.ts"
-import type { ServerMessage } from "./protocol.ts"
+import {
+  CORE_BROADCAST_EVENTS,
+  type LogEvent,
+  RelayCore,
+} from "./core.ts"
 
-const CLIENT_STALE_MS = 30_000
-const CLEANUP_INTERVAL_MS = 10_000
+/** Default location of the built dashboard, relative to this file: project-root/web/dist. */
+const DEFAULT_STATIC_DIR = resolve(import.meta.dir, "..", "..", "web", "dist")
 
-let serverLogPath: string | null = null
-function slog(msg: string): void {
-  if (!serverLogPath) {
-    serverLogPath = join(getStateDir(), "cross-session-relay-server.log")
-    mkdirSync(dirname(serverLogPath), { recursive: true })
-  }
-  try {
-    appendFileSync(serverLogPath, `${new Date().toISOString()} ${msg}\n`)
-  } catch {
-    /* ignore */
-  }
-}
-
-interface PendingAsk {
-  callerClientId: string
-  targetSessionId: string
+export interface RelayServerOptions {
+  port?: number
+  staticDir?: string
 }
 
 export class RelayServer {
   readonly port: number
+  readonly core: RelayCore
+  private readonly staticDir: string
   private server: Server<undefined> | null = null
-  private readonly sessions = new Map<string, RegistryEntry>()
-  private readonly sessionToClient = new Map<string, string>()
-  private readonly clientToSessions = new Map<string, Set<string>>()
-  private readonly clientLastSeen = new Map<string, number>()
-  private readonly clientIps = new Map<string, string>()
-  private readonly clientQueues = new Map<string, ServerMessage[]>()
-  private readonly pendingAsks = new Map<string, PendingAsk>()
-  private cleanupTimer: ReturnType<typeof setInterval> | null = null
+  private readonly wsClients = new Set<ServerWebSocket<unknown>>()
+  private serverLogPath: string | null = null
+  private readonly coreListeners: Array<{
+    event: string
+    fn: (data: unknown) => void
+  }> = []
+  private readonly logListener: (evt: LogEvent) => void
 
-  constructor(port: number = RELAY_DEFAULT_PORT) {
-    this.port = port
-  }
-
-  get connectedClients(): number {
-    const cutoff = Date.now() - CLIENT_STALE_MS
-    let count = 0
-    for (const ts of this.clientLastSeen.values()) {
-      if (ts >= cutoff) count++
+  constructor(portOrOpts?: number | RelayServerOptions) {
+    if (typeof portOrOpts === "number") {
+      this.port = portOrOpts
+      this.staticDir = DEFAULT_STATIC_DIR
+    } else {
+      this.port = portOrOpts?.port ?? RELAY_DEFAULT_PORT
+      this.staticDir = portOrOpts?.staticDir ?? DEFAULT_STATIC_DIR
     }
-    return count
-  }
-
-  get clientDetails(): Array<{ ip: string; sessions: string[] }> {
-    const cutoff = Date.now() - CLIENT_STALE_MS
-    const details: Array<{ ip: string; sessions: string[] }> = []
-    for (const [cid, ts] of this.clientLastSeen) {
-      if (ts < cutoff) continue
-      const sids = this.clientToSessions.get(cid)
-      details.push({
-        ip: this.clientIps.get(cid) ?? "unknown",
-        sessions: sids ? [...sids] : [],
-      })
-    }
-    return details
+    this.core = new RelayCore()
+    this.logListener = (evt: LogEvent) => this.writeLog(evt)
+    this.core.on("log", this.logListener)
   }
 
   get peersByDevice(): Array<{ device: string; count: number }> {
-    const counts = new Map<string, number>()
-    for (const entry of this.sessions.values()) {
-      const device = entry.deviceName ?? "unknown"
-      counts.set(device, (counts.get(device) ?? 0) + 1)
-    }
-    return [...counts.entries()].map(([device, count]) => ({ device, count }))
+    return this.core.peersByDevice
+  }
+
+  get connectedClients(): number {
+    return this.core.connectedClients
+  }
+
+  get clientDetails(): Array<{ ip: string; sessions: string[] }> {
+    return this.core.clientDetails
   }
 
   start(): void {
     if (this.server) return
+    this.subscribeCoreEvents()
     this.server = Bun.serve({
       port: this.port,
       hostname: "0.0.0.0",
-      fetch: (req, server) => this.handleRequest(req, server),
+      fetch: (req, srv) => this.handleRequest(req, srv),
+      websocket: {
+        open: (ws) => this.onWsOpen(ws),
+        close: (ws) => this.onWsClose(ws),
+        message: () => {
+          /* dashboard is read-only */
+        },
+      },
     })
-    this.cleanupTimer = setInterval(
-      () => this.cleanupStaleClients(),
-      CLEANUP_INTERVAL_MS,
-    )
-    slog(`[relay] listening on 0.0.0.0:${this.port}`)
+    this.writeLog({
+      level: "info",
+      tag: "relay",
+      message: `listening on 0.0.0.0:${this.port}`,
+    })
   }
 
   stop(): void {
     if (!this.server) return
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer)
-      this.cleanupTimer = null
+    for (const ws of this.wsClients) {
+      try {
+        ws.close()
+      } catch {
+        /* ignore */
+      }
     }
+    this.wsClients.clear()
+    this.unsubscribeCoreEvents()
     this.server.stop(true)
     this.server = null
-    this.sessions.clear()
-    this.sessionToClient.clear()
-    this.clientToSessions.clear()
-    this.clientLastSeen.clear()
-    this.clientIps.clear()
-    this.clientQueues.clear()
-    this.pendingAsks.clear()
-    slog(`[relay] stopped`)
+    this.core.dispose()
+    this.writeLog({ level: "info", tag: "relay", message: "stopped" })
+  }
+
+  private subscribeCoreEvents(): void {
+    for (const event of CORE_BROADCAST_EVENTS) {
+      const fn = (data: unknown) => this.broadcast({ type: event, data })
+      this.core.on(event, fn)
+      this.coreListeners.push({ event, fn })
+    }
+  }
+
+  private unsubscribeCoreEvents(): void {
+    for (const { event, fn } of this.coreListeners) {
+      this.core.off(event, fn)
+    }
+    this.coreListeners.length = 0
+  }
+
+  private broadcast(event: { type: string; data: unknown }): void {
+    let json: string
+    try {
+      json = JSON.stringify(event)
+    } catch {
+      return
+    }
+    for (const ws of this.wsClients) {
+      try {
+        ws.send(json)
+      } catch {
+        /* client gone; will be cleaned by close handler */
+      }
+    }
+  }
+
+  private onWsOpen(ws: ServerWebSocket<unknown>): void {
+    this.wsClients.add(ws)
+    try {
+      ws.send(
+        JSON.stringify({ type: "snapshot", data: this.core.getSnapshot() }),
+      )
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private onWsClose(ws: ServerWebSocket<unknown>): void {
+    this.wsClients.delete(ws)
+  }
+
+  private writeLog(evt: LogEvent): void {
+    if (!this.serverLogPath) {
+      this.serverLogPath = join(getStateDir(), "cross-session-relay-server.log")
+      try {
+        mkdirSync(dirname(this.serverLogPath), { recursive: true })
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      appendFileSync(
+        this.serverLogPath,
+        `${new Date().toISOString()} [${evt.level}] [${evt.tag}] ${evt.message}\n`,
+      )
+    } catch {
+      /* ignore */
+    }
   }
 
   private async handleRequest(
     req: Request,
     server: Server<undefined>,
-  ): Promise<Response> {
+  ): Promise<Response | undefined> {
     try {
       const url = new URL(req.url)
       const path = url.pathname
 
+      if (path === "/ws") {
+        if (server.upgrade(req)) return undefined
+        return new Response("Expected WebSocket upgrade", { status: 400 })
+      }
+
       if (path === "/stats" && req.method === "GET") {
-        return Response.json({ peers: this.peersByDevice })
+        return Response.json({ peers: this.core.peersByDevice })
       }
 
       if (path === "/api/poll" && req.method === "GET") {
@@ -127,64 +184,22 @@ export class RelayServer {
             { status: 400 },
           )
         }
-        this.touchClient(clientId, req, server)
-        return this.handlePoll(clientId)
+        this.core.touchClient(clientId, this.tryGetClientIp(req, server))
+        const messages = this.core.poll(clientId)
+        return Response.json({ messages })
       }
 
-      if (req.method !== "POST") {
-        slog(
-          `[relay] rejected ${req.method} ${path} (method not allowed)`,
-        )
-        return Response.json(
-          { error: "method not allowed" },
-          { status: 405 },
-        )
+      if (path.startsWith("/api/")) {
+        return await this.handleApiPost(req, server, path)
       }
 
-      let body: Record<string, unknown>
-      try {
-        body = (await req.json()) as Record<string, unknown>
-      } catch {
-        slog(`[relay] rejected POST ${path} (invalid JSON)`)
-        return Response.json(
-          { error: "invalid JSON body" },
-          { status: 400 },
-        )
-      }
-
-      const clientId = body.clientId as string | undefined
-      if (!clientId) {
-        slog(`[relay] rejected POST ${path} (missing clientId)`)
-        return Response.json(
-          { error: "clientId required" },
-          { status: 400 },
-        )
-      }
-
-      this.touchClient(clientId, req, server)
-      const cid = clientId.slice(0, 8)
-
-      switch (path) {
-        case "/api/register":
-          return this.handleRegister(clientId, cid, body)
-        case "/api/unregister":
-          return this.handleUnregister(clientId, cid, body)
-        case "/api/list":
-          return this.handleList(cid, body)
-        case "/api/lookup":
-          return this.handleLookup(cid, body)
-        case "/api/ask":
-          return this.handleAsk(clientId, cid, body)
-        case "/api/reply":
-          return this.handleReply(cid, body)
-        default:
-          slog(`[relay] 404 POST ${path} from ${cid}`)
-          return Response.json({ error: "not found" }, { status: 404 })
-      }
+      return await this.serveStatic(path)
     } catch (err) {
-      slog(
-        `[relay] request error: ${(err as Error).message}`,
-      )
+      this.writeLog({
+        level: "error",
+        tag: "relay",
+        message: `request error: ${(err as Error).message}`,
+      })
       return Response.json(
         { error: `internal error: ${(err as Error).message}` },
         { status: 500 },
@@ -192,251 +207,178 @@ export class RelayServer {
     }
   }
 
-  private touchClient(
-    clientId: string,
+  private async handleApiPost(
     req: Request,
     server: Server<undefined>,
-  ): void {
-    const isNew = !this.clientLastSeen.has(clientId)
-    this.clientLastSeen.set(clientId, Date.now())
+    path: string,
+  ): Promise<Response> {
+    if (req.method !== "POST") {
+      this.writeLog({
+        level: "warn",
+        tag: "relay",
+        message: `rejected ${req.method} ${path} (method not allowed)`,
+      })
+      return Response.json(
+        { error: "method not allowed" },
+        { status: 405 },
+      )
+    }
+
+    let body: Record<string, unknown>
+    try {
+      body = (await req.json()) as Record<string, unknown>
+    } catch {
+      this.writeLog({
+        level: "warn",
+        tag: "relay",
+        message: `rejected POST ${path} (invalid JSON)`,
+      })
+      return Response.json(
+        { error: "invalid JSON body" },
+        { status: 400 },
+      )
+    }
+
+    const clientId = body.clientId as string | undefined
+    if (!clientId) {
+      this.writeLog({
+        level: "warn",
+        tag: "relay",
+        message: `rejected POST ${path} (missing clientId)`,
+      })
+      return Response.json(
+        { error: "clientId required" },
+        { status: 400 },
+      )
+    }
+
+    this.core.touchClient(clientId, this.tryGetClientIp(req, server))
+
+    switch (path) {
+      case "/api/register": {
+        const entry = this.core.register(clientId, {
+          sessionId: body.sessionId as string,
+          summary: body.summary as string,
+          directory: body.directory as string,
+          projectId: body.projectId as string,
+          serverUrl: body.serverUrl as string | undefined,
+          daemonId: body.daemonId as string | undefined,
+          deviceName: body.deviceName as string | undefined,
+        })
+        return Response.json({
+          type: "registered",
+          sessionId: entry.sessionId,
+          entry,
+        })
+      }
+      case "/api/unregister": {
+        const sessionId = body.sessionId as string
+        const removed = this.core.unregister(clientId, sessionId)
+        return Response.json({
+          type: "unregistered",
+          sessionId,
+          removed,
+        })
+      }
+      case "/api/list": {
+        const requestId = body.requestId as string
+        const entries = this.core.list()
+        return Response.json({ type: "sessions", requestId, entries })
+      }
+      case "/api/lookup": {
+        const requestId = body.requestId as string
+        const sessionId = body.sessionId as string
+        const entry = this.core.lookup(sessionId)
+        return Response.json({ type: "looked-up", requestId, entry })
+      }
+      case "/api/ask": {
+        const result = this.core.ask(clientId, {
+          requestId: body.requestId as string,
+          toSessionId: body.toSessionId as string,
+          question: body.question as string,
+          timeoutMs: body.timeoutMs as number,
+        })
+        return Response.json(result)
+      }
+      case "/api/reply": {
+        this.core.reply({
+          requestId: body.requestId as string,
+          reply: body.reply as string | undefined,
+          error: body.error as string | undefined,
+        })
+        return Response.json({ ok: true })
+      }
+      default:
+        this.writeLog({
+          level: "warn",
+          tag: "relay",
+          message: `404 POST ${path} from ${clientId.slice(0, 8)}`,
+        })
+        return Response.json({ error: "not found" }, { status: 404 })
+    }
+  }
+
+  private tryGetClientIp(
+    req: Request,
+    server: Server<undefined>,
+  ): string | undefined {
     try {
       const addr = server.requestIP(req)
-      if (addr) this.clientIps.set(clientId, addr.address)
+      return addr?.address
     } catch {
-      /* ignore */
-    }
-    if (!this.clientToSessions.has(clientId)) {
-      this.clientToSessions.set(clientId, new Set())
-    }
-    if (!this.clientQueues.has(clientId)) {
-      this.clientQueues.set(clientId, [])
-    }
-    if (isNew) {
-      const ip = this.clientIps.get(clientId) ?? "unknown"
-      slog(
-        `[relay] new client ${clientId.slice(0, 8)} from ${ip} (total=${this.clientLastSeen.size})`,
-      )
+      return undefined
     }
   }
 
-  private handlePoll(clientId: string): Response {
-    const queue = this.clientQueues.get(clientId)
-    if (!queue || queue.length === 0) {
-      return Response.json({ messages: [] })
-    }
-    const messages = [...queue]
-    queue.length = 0
-    slog(
-      `[relay] poll ${clientId.slice(0, 8)} → ${messages.length} msg(s): [${messages.map((m) => m.type).join(", ")}]`,
-    )
-    return Response.json({ messages })
-  }
-
-  private handleRegister(
-    clientId: string,
-    cid: string,
-    body: Record<string, unknown>,
-  ): Response {
-    const sessionId = body.sessionId as string
-    const now = Date.now()
-    const existing = this.sessions.get(sessionId)
-    const entry: RegistryEntry = {
-      sessionId,
-      summary: body.summary as string,
-      directory: body.directory as string,
-      projectId: body.projectId as string,
-      serverUrl: body.serverUrl as string | undefined,
-      daemonId: body.daemonId as string | undefined,
-      deviceName: body.deviceName as string | undefined,
-      registeredAt: existing?.registeredAt ?? now,
-      updatedAt: now,
+  private async serveStatic(path: string): Promise<Response> {
+    if (!existsSync(this.staticDir)) {
+      return this.dashboardNotBuiltResponse(path)
     }
 
-    const oldOwner = this.sessionToClient.get(sessionId)
-    if (oldOwner && oldOwner !== clientId) {
-      this.clientToSessions.get(oldOwner)?.delete(sessionId)
-      slog(
-        `[relay] register: session ${sessionId} moved from client ${oldOwner.slice(0, 8)} to ${cid}`,
-      )
+    const rel = path === "/" ? "/index.html" : path
+    const requestedPath = resolve(this.staticDir, `.${rel}`)
+    if (
+      requestedPath !== this.staticDir &&
+      !requestedPath.startsWith(this.staticDir + "/")
+    ) {
+      return new Response("Not found", { status: 404 })
     }
 
-    this.sessions.set(sessionId, entry)
-    this.sessionToClient.set(sessionId, clientId)
-    const owned = this.clientToSessions.get(clientId) ?? new Set<string>()
-    owned.add(sessionId)
-    this.clientToSessions.set(clientId, owned)
+    const file = Bun.file(requestedPath)
+    if (await file.exists()) {
+      return new Response(file)
+    }
 
-    slog(
-      `[relay] registered ${sessionId} (client=${cid}, device=${entry.deviceName ?? "?"}, sessions=${this.sessions.size})`,
-    )
-    return Response.json({ type: "registered", sessionId, entry })
-  }
-
-  private handleUnregister(
-    clientId: string,
-    cid: string,
-    body: Record<string, unknown>,
-  ): Response {
-    const sessionId = body.sessionId as string
-    const existed = this.sessions.delete(sessionId)
-    this.sessionToClient.delete(sessionId)
-    this.clientToSessions.get(clientId)?.delete(sessionId)
-    slog(
-      `[relay] unregistered ${sessionId} (client=${cid}, existed=${existed}, sessions=${this.sessions.size})`,
-    )
-    return Response.json({
-      type: "unregistered",
-      sessionId,
-      removed: existed,
-    })
-  }
-
-  private handleList(
-    cid: string,
-    body: Record<string, unknown>,
-  ): Response {
-    const requestId = body.requestId as string
-    const cutoff = Date.now() - STALE_ENTRY_TTL_MS
-    const entries = [...this.sessions.values()]
-      .filter((e) => e.updatedAt >= cutoff)
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-    slog(
-      `[relay] list (client=${cid}) → ${entries.length} session(s)`,
-    )
-    return Response.json({ type: "sessions", requestId, entries })
-  }
-
-  private handleLookup(
-    cid: string,
-    body: Record<string, unknown>,
-  ): Response {
-    const requestId = body.requestId as string
-    const sessionId = body.sessionId as string
-    const entry = this.sessions.get(sessionId) ?? null
-    slog(
-      `[relay] lookup ${sessionId} (client=${cid}) → ${entry ? "found" : "not found"}`,
-    )
-    return Response.json({ type: "looked-up", requestId, entry })
-  }
-
-  private handleAsk(
-    clientId: string,
-    cid: string,
-    body: Record<string, unknown>,
-  ): Response {
-    const requestId = body.requestId as string
-    const toSessionId = body.toSessionId as string
-    const question = body.question as string
-    const timeoutMs = body.timeoutMs as number
-    const rid = requestId.slice(0, 8)
-
-    const targetClientId = this.sessionToClient.get(toSessionId)
-    if (!targetClientId) {
-      slog(
-        `[relay] ask ${rid} from ${cid} → target ${toSessionId} NOT FOUND`,
-      )
-      return Response.json({
-        ok: false,
-        error: `Target session ${toSessionId} not found`,
+    const indexPath = join(this.staticDir, "index.html")
+    const indexFile = Bun.file(indexPath)
+    if (await indexFile.exists()) {
+      return new Response(indexFile, {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
       })
     }
 
-    const callerSessions = this.clientToSessions.get(clientId)
-    const fromSessionId: string =
-      callerSessions?.values().next().value ?? "unknown"
-
-    this.pendingAsks.set(requestId, {
-      callerClientId: clientId,
-      targetSessionId: toSessionId,
-    })
-
-    this.enqueue(targetClientId, {
-      type: "inbound",
-      requestId,
-      fromSessionId,
-      toSessionId,
-      question,
-      timeoutMs,
-    })
-
-    slog(
-      `[relay] ask ${rid}: ${fromSessionId} → ${toSessionId} (target-client=${targetClientId.slice(0, 8)}, qLen=${question.length}, timeout=${timeoutMs}ms)`,
-    )
-    return Response.json({ ok: true })
+    return this.dashboardNotBuiltResponse(path)
   }
 
-  private handleReply(
-    cid: string,
-    body: Record<string, unknown>,
-  ): Response {
-    const requestId = body.requestId as string
-    const reply = body.reply as string | undefined
-    const error = body.error as string | undefined
-    const rid = requestId.slice(0, 8)
-
-    const pending = this.pendingAsks.get(requestId)
-    if (!pending) {
-      slog(
-        `[relay] reply ${rid} from ${cid} → no pending ask (stale/duplicate)`,
-      )
-      return Response.json({ ok: true })
+  private dashboardNotBuiltResponse(path: string): Response {
+    if (path !== "/") {
+      return new Response("Not found", { status: 404 })
     }
-
-    this.pendingAsks.delete(requestId)
-    this.enqueue(pending.callerClientId, {
-      type: "reply",
-      requestId,
-      reply,
-      error,
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Cross-Session Relay</title>
+  <style>body{font-family:system-ui,sans-serif;max-width:640px;margin:2rem auto;padding:0 1rem;line-height:1.5}code{background:#f4f4f4;padding:.15rem .4rem;border-radius:3px}</style>
+</head>
+<body>
+  <h1>Dashboard not built yet</h1>
+  <p>Run: <code>bun run dashboard:build</code></p>
+  <p>Server is running on port <strong>${this.port}</strong>. API endpoints under <code>/api/*</code> and the WebSocket at <code>/ws</code> are functional.</p>
+</body>
+</html>`
+    return new Response(html, {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
     })
-
-    slog(
-      `[relay] reply ${rid} from ${cid} → queued to ${pending.callerClientId.slice(0, 8)} (replyLen=${reply?.length ?? 0}, error=${error ?? "none"})`,
-    )
-    return Response.json({ ok: true })
-  }
-
-  private enqueue(clientId: string, msg: ServerMessage): void {
-    let queue = this.clientQueues.get(clientId)
-    if (!queue) {
-      queue = []
-      this.clientQueues.set(clientId, queue)
-    }
-    queue.push(msg)
-  }
-
-  private cleanupStaleClients(): void {
-    const cutoff = Date.now() - CLIENT_STALE_MS
-    for (const [clientId, lastSeen] of this.clientLastSeen) {
-      if (lastSeen >= cutoff) continue
-
-      const owned = this.clientToSessions.get(clientId) ?? new Set()
-      for (const sid of owned) {
-        this.sessions.delete(sid)
-        this.sessionToClient.delete(sid)
-      }
-
-      for (const [reqId, pending] of this.pendingAsks) {
-        if (pending.callerClientId === clientId) {
-          this.pendingAsks.delete(reqId)
-        } else if (owned.has(pending.targetSessionId)) {
-          this.enqueue(pending.callerClientId, {
-            type: "reply",
-            requestId: reqId,
-            error: `Target session ${pending.targetSessionId} disconnected`,
-          })
-          this.pendingAsks.delete(reqId)
-        }
-      }
-
-      this.clientToSessions.delete(clientId)
-      this.clientLastSeen.delete(clientId)
-      this.clientIps.delete(clientId)
-      this.clientQueues.delete(clientId)
-
-      slog(
-        `[relay] cleanup: stale client ${clientId.slice(0, 8)} removed (${owned.size} sessions, remaining clients=${this.clientLastSeen.size})`,
-      )
-    }
   }
 }

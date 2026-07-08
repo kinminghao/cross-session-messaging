@@ -14,5 +14,6 @@
     "lib": ["ESNext"],
     "types": ["node", "bun"]
   },
-  "include": ["src/**/*", "tui.tsx"]
+  "include": ["src/**/*", "tui.tsx"],
+  "exclude": ["web"]
 }
